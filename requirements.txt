@@ -1,0 +1,10 @@
+pdfplumber
+PyMuPDF
+pandas
+tabula-py
+deepdiff
+imagehash
+Pillow
+reportlab
+tqdm
+openpyxl

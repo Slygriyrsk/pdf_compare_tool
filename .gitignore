@@ -1,0 +1,13 @@
+__pycahce__/
+pdf_env
+.env
+*.pid
+*.log
+*.pot
+*.pyc
+*.pyo
+*.pyd
+*.pdf
+build/
+dist/
+*egg-info/
