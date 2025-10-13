@@ -5,6 +5,10 @@ tabula-py
 deepdiff
 imagehash
 Pillow
-reportlab
 tqdm
 openpyxl
+
+pymupdf4llm
+difflib
+reportlab
+python-docx
