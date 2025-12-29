@@ -754,3 +754,443 @@ python pdf_comparison_tool.py old.pdf new.pdf docx
 - ✅ Exception handling throughout
 - ✅ Fuzzy matching threshold (75%) to avoid false positives
 - ✅ Cross-validation of results
+- 
+
+Project Problem Statement and Overall Objective
+
+This project focuses on the efficient transmission and early detection of anomalies in longitudinal aircraft parameters under bandwidth and computational constraints. In practical aerospace and avionics systems, a large number of flight parameters such as angle of attack (α), pitch angle (θ), pitch rate (q), longitudinal velocities (Vx, Vz), positions (x, z), and elevator deflection (δe) are continuously generated at high sampling rates. Transmitting raw high-rate data from all sensors to a ground station or monitoring module is costly in terms of bandwidth, storage, and latency. Therefore, the central objective of this project is to design, simulate, and compare multiple anomaly detection and data-reduction strategies that can identify sensor or system faults quickly while minimizing transmitted data, all within the constraint of 32-bit integer packing.
+
+System Modeling and Signal Generation
+
+The system is restricted to longitudinal aircraft dynamics, consistent with classical pitch modeling used in flight control analysis. Instead of directly integrating acceleration signals (which introduces numerical drift and noise amplification), the aircraft parameters are synthetically generated using sinusoidal functions with different amplitudes and frequencies. This approach preserves realistic aircraft-like behavior while keeping the simulation deterministic and easy to debug. Each signal represents a physical aircraft parameter, and faults are injected as step biases at different times for each parameter, emulating realistic sensor bias faults rather than synchronized or artificial failures.
+
+A common early misconception was assuming that all anomalies should occur at the same time or appear as isolated spikes. In reality, sensor biases are persistent faults, not instantaneous glitches, and thus affect all subsequent samples after the fault time.
+
+Anomaly Detection Approaches Implemented
+
+Three primary detection strategies were developed and compared:
+
+1. Raw Sample-Level Detection
+
+In this method, the absolute difference between the healthy and faulty signals is compared directly against a threshold at each time step. While this approach is simple and detects anomalies quickly, it is highly sensitive to noise and transient spikes, making it unreliable for real systems. One initial confusion was observing negative or zero detection delays, which occurred when the threshold was crossed before the nominal fault time due to natural signal oscillations. This highlighted why raw detection is unsafe in practical avionics applications.
+
+2. Windowed / Sliced Feature Detection
+
+To improve robustness, the signals were divided into fixed-length time windows (e.g., 1 second), and a window-level feature such as the mean absolute residual was computed. This produces staircase-shaped (square pulse) plots, which initially appeared incorrect but are actually expected and correct, since each window produces a single constant feature value. This method effectively filters out transient glitches while detecting persistent faults. A key learning outcome here was understanding that window features are decision metrics, not signals, and therefore should not resemble continuous waveforms.
+
+3. Model-Based Estimation (Prediction Residuals)
+
+In this approach, a simplified healthy model predicts the expected signal behavior, and the residual (measured − predicted) is monitored. This method mimics real model-based fault detection systems used in aerospace. Residual spikes occur at the instant of fault injection due to model mismatch, followed by sustained residual offsets if the fault persists. A major misconception corrected here was assuming that residual threshold crossings automatically indicate faults; in reality, persistence over time or across windows is required to distinguish faults from glitches.
+
+Kalman Filter Extension
+
+To further improve estimation quality, a Kalman filter was introduced. Unlike simple prediction, the Kalman filter optimally fuses prior state estimates with new measurements under uncertainty. The Kalman residual reflects how much the measured signal deviates from the statistically expected behavior. Spikes in the Kalman residual do not necessarily imply faults; instead, they indicate moments of high innovation. Persistent residual bias indicates a sensor fault. This distinction clarified why many residual plots initially appeared alarming but were in fact normal system responses.
+
+Compression and 32-Bit Packing Strategy
+
+A major contribution of this project is demonstrating how multiple sensor signals can be compressed and packed into a single 32-bit unsigned integer. By scaling and quantizing four signals at a time, their values are encoded using fixed decimal positions. This allows multiple parameters to be transmitted efficiently in one word. The packed values were verified to remain well within the 32-bit limit (4,294,967,295). A key realization was that the packed integer itself is not used directly for detection; instead, it serves as a bandwidth-efficient carrier, and anomaly detection operates on either unpacked signals or derived features.
+
+Performance Metrics and Analysis
+
+Detection delay, error percentage, and anomaly confirmation time were computed for all methods. Raw detection was fastest but unreliable, windowed detection provided stable and interpretable results, and model-based (Kalman) detection offered the best balance between sensitivity and robustness. Initial NaN results in plots were traced back to cases where no detection occurred, reinforcing the importance of defensive coding and proper threshold selection.
+
+Key Learning Outcomes and Misconceptions Resolved
+
+Square pulses in window plots are correct and represent aggregated anomaly energy.
+
+Residual threshold crossings alone do not confirm faults.
+
+Persistent bias ≠ glitch.
+
+Fast detection is meaningless without robustness.
+
+Compression reduces bandwidth but must preserve diagnosability.
+
+Conclusion
+
+This project demonstrates a complete pipeline for aircraft signal simulation, anomaly injection, detection, compression, and performance evaluation. Through iterative debugging and analysis, the system evolved from naive raw detection to more realistic and industry-aligned windowed and model-based methods. The final framework provides a scalable, interpretable, and efficient approach to airborne anomaly detection suitable for constrained communication environments, while also serving as a strong foundation for future extensions such as multivariate fault isolation and adaptive thresholds.
+
+2. Signal Generation and Fault Injection (Why This Setup?)
+
+Instead of using real flight test data, synthetic signals were generated using sinusoidal models. This decision was deliberate:
+
+Aircraft longitudinal motion naturally contains oscillatory components.
+
+Using known mathematical signals makes the “ground truth” clear.
+
+Fault effects can be isolated and interpreted visually.
+
+Each signal has:
+
+a normal (healthy) waveform, and
+
+a faulty waveform, where a bias is introduced at a specific time.
+
+Important Clarification (Common Misconception)
+
+A fault is not a single spike.
+A fault is usually a persistent bias or deviation starting at a time and continuing afterward.
+This is why after the fault time, the difference between healthy and faulty signals does not return to zero.
+
+3. Difference (Diff) Plots – What They Represent and Why They Exist
+What is a Diff Plot?
+
+Each “Diff” plot shows:
+
+Diff
+(
+𝑡
+)
+=
+∣
+𝑦
+faulty
+(
+𝑡
+)
+−
+𝑦
+healthy
+(
+𝑡
+)
+∣
+Diff(t)=∣y
+faulty
+	​
+
+(t)−y
+healthy
+	​
+
+(t)∣
+
+This is the absolute error caused by the fault.
+
+Why do we plot Diff signals?
+
+They convert the problem from “complex waveform comparison” to error magnitude monitoring.
+
+Fault detection becomes threshold-based instead of waveform-based.
+
+Why do we see oscillations even before the fault?
+
+Because the original signals are oscillatory. Even small modeling mismatches or noise will produce non-zero differences. This is normal behavior, not a fault.
+
+What does the vertical line indicate?
+
+The vertical line marks the actual fault injection time.
+Anything after that line should show statistically different behavior if the fault is real.
+
+4. Why Raw Threshold Detection Is Not Enough
+
+In raw detection, the algorithm checks:
+
+Diff
+(
+𝑡
+)
+>
+threshold
+Diff(t)>threshold
+
+This raises two problems:
+
+False positives
+Oscillations naturally cross thresholds.
+
+Negative detection delay confusion
+Sometimes the threshold is crossed before the actual fault time due to oscillations.
+
+Key Insight
+
+Raw sample-by-sample detection cannot distinguish:
+
+a one-sample glitch, from
+
+a persistent fault.
+
+This is why raw detection alone is unsafe in real systems.
+
+5. Window Feature Plots – Why They Look Like Square Pulses
+What is Windowing?
+
+Instead of examining individual samples, the signal is divided into fixed time windows (e.g., 1 second).
+
+For each window, a feature is computed:
+
+mean absolute diff,
+
+energy,
+
+RMS, etc.
+
+That feature produces one number per window.
+
+Why do the plots look like square waves?
+
+Because:
+
+Each window produces one constant value.
+
+The value only updates when the window changes.
+
+So visually:
+
+Continuous signal → stepped (square) feature signal.
+
+This is expected and correct behavior, not an error.
+
+What does a rising square pulse mean?
+
+It means:
+
+“Across this entire window, the signal consistently showed abnormal behavior.”
+
+This directly answers the glitch vs fault question.
+
+6. Glitch vs Fault — How the Code and Plots Distinguish Them
+One-sample glitch:
+
+Affects 1–2 samples
+
+Gets averaged out inside a window
+
+Window feature stays below threshold
+
+Real fault:
+
+Persists across many samples
+
+Raises window feature consistently
+
+Crosses threshold for multiple windows
+
+So:
+
+Raw plots show spikes
+
+Window plots confirm persistence
+
+This is why windowing is used in avionics and industrial monitoring.
+
+7. Kalman Filter Estimation – What It Actually Does Here
+What is the Kalman filter doing?
+
+It predicts what the signal should be based on:
+
+previous state,
+
+system dynamics,
+
+noise assumptions.
+
+Then it computes the residual:
+
+𝑟
+(
+𝑡
+)
+=
+𝑦
+measured
+(
+𝑡
+)
+−
+𝑦
+estimated
+(
+𝑡
+)
+r(t)=y
+measured
+	​
+
+(t)−y
+estimated
+	​
+
+(t)
+What does the “Signal vs Kalman Estimate” plot show?
+
+Blue line: actual measured signal
+
+Dashed line: Kalman estimate
+
+When the system is healthy:
+
+both lines overlap closely
+
+After a fault:
+
+estimation lags or deviates
+
+residual grows
+
+8. Kalman Residual Plot – Why Spikes Appear
+What does a residual spike mean?
+
+A spike means:
+
+“The measurement suddenly disagrees with what the model expects.”
+
+This does not automatically mean a fault.
+
+Possible causes:
+
+noise burst,
+
+modeling mismatch,
+
+sudden maneuver,
+
+sensor glitch.
+
+How do we confirm a fault?
+
+Again: persistence.
+
+A real fault causes:
+
+residual bias or increased variance
+
+sustained over time or windows
+
+A glitch:
+
+produces a sharp spike
+
+quickly returns to normal
+
+This is why thresholds alone are not sufficient.
+
+9. 32-Bit Integer Packing – Why It Exists and Why 32 Bits
+Why compress signals at all?
+
+In real aircraft:
+
+telemetry bandwidth is limited
+
+transmitting floats is expensive
+
+integers are faster and safer
+
+Why 32-bit specifically?
+
+32-bit unsigned integers are universally supported
+
+Maximum value: 4,294,967,295
+
+Easy alignment with hardware registers
+
+Safe margin for packing multiple scaled signals
+
+What is being packed?
+
+Multiple normalized sensor features are:
+
+scaled,
+
+quantized,
+
+packed into one integer using place values.
+
+Example idea:
+
+packed
+=
+𝑎
+×
+10
+6
++
+𝑏
+×
+10
+4
++
+𝑐
+×
+10
+2
++
+𝑑
+packed=a×10
+6
++b×10
+4
++c×10
+2
++d
+Important Clarification
+
+The packed integer:
+
+is not used directly for detection
+
+is used for efficient transmission
+
+is unpacked on the receiving side for analysis
+
+This mirrors real airborne-to-ground systems.
+
+10. Why Some Signals Don’t Show Clear Detection
+
+For signals like δe:
+
+amplitude is small,
+
+fault magnitude is small,
+
+window feature may remain below threshold.
+
+This does not mean the method failed.
+It means:
+
+the fault is below detectability for chosen thresholds.
+
+In real systems, thresholds are signal-specific.
+
+11. Why You “Cannot See” Some Faults Clearly
+
+Because:
+
+detection is statistical, not visual
+
+humans look for spikes
+
+algorithms look for persistence
+
+This was a key misconception resolved during the project.
+
+12. Final Engineering Takeaway
+
+This project demonstrates that:
+
+Fault detection is not spike detection
+
+Windowing converts noise into evidence
+
+Kalman residuals indicate disagreement, not faults
+
+Compression must preserve detectability
+
+One sample means nothing; persistence means everything
+
+13. Why This Work Is Relevant
+
+This framework resembles:
+
+aircraft health monitoring,
+
+satellite telemetry validation,
+
+industrial predictive maintenance,
+
+autonomous vehicle diagnostics.
+
+And importantly:
+
+It shows engineering judgment, not just code execution.
+
