@@ -1,0 +1,826 @@
+%% ========================================================================
+%  INTELLIGENT ADAPTIVE TELEMETRY COMPRESSION AND ANOMALY DETECTION SYSTEM
+%  NO TOOLBOXES REQUIRED - BASE MATLAB ONLY
+%  ========================================================================
+%  
+%  PATENT DISCLOSURE: Novel System for Real-Time Aircraft Data Transmission
+%  
+%  This version implements ALL functionality without requiring:
+%  - Statistics Toolbox
+%  - Control System Toolbox
+%  - Signal Processing Toolbox
+%  
+%  All chi-squared, normal distribution functions implemented from scratch
+%  ========================================================================
+
+clear; clc; close all;
+
+fprintf('========================================\n');
+fprintf('INITIALIZING AEROSPACE TELEMETRY SYSTEM\n');
+fprintf('BASE MATLAB VERSION (NO TOOLBOXES)\n');
+fprintf('========================================\n\n');
+
+%% ========================================================================
+%  SECTION 1: HELPER FUNCTIONS (Replacing Toolbox Dependencies)
+%  ========================================================================
+
+% Chi-squared inverse CDF (replaces chi2inv from Statistics Toolbox)
+function x = chi2inv_custom(p, df)
+    % Newton-Raphson method to find chi2 inverse
+    % For our application: p=0.99, df=15 or df=1
+    if df == 1
+        % For df=1, use simple approximation
+        z = norminv_custom(p);
+        x = z^2;
+    else
+        % For larger df, use Wilson-Hilferty approximation
+        z = norminv_custom(p);
+        x = df * (1 - 2/(9*df) + z*sqrt(2/(9*df)))^3;
+    end
+end
+
+% Normal inverse CDF (replaces norminv)
+function x = norminv_custom(p)
+    % Approximation of inverse normal CDF (Beasley-Springer-Moro algorithm)
+    if p <= 0 || p >= 1
+        error('Probability must be between 0 and 1');
+    end
+    
+    % Coefficients for rational approximation
+    a = [2.50662823884, -18.61500062529, 41.39119773534, -25.44106049637];
+    b = [-8.47351093090, 23.08336743743, -21.06224101826, 3.13082909833];
+    c = [0.3374754822726147, 0.9761690190917186, 0.1607979714918209, ...
+         0.0276438810333863, 0.0038405729373609, 0.0003951896511919, ...
+         0.0000321767881768, 0.0000002888167364, 0.0000003960315187];
+    
+    y = p - 0.5;
+    
+    if abs(y) < 0.42
+        % Central region
+        r = y^2;
+        x = y * (((a(4)*r + a(3))*r + a(2))*r + a(1)) / ...
+            ((((b(4)*r + b(3))*r + b(2))*r + b(1))*r + 1);
+    else
+        % Tail region
+        if y > 0
+            r = 1 - p;
+        else
+            r = p;
+        end
+        r = sqrt(-log(r));
+        
+        if r <= 5.0
+            r = r - 1.6;
+            x = (((((((c(9)*r + c(8))*r + c(7))*r + c(6))*r + c(5))*r + ...
+                   c(4))*r + c(3))*r + c(2))*r + c(1)) / ...
+                ((r + 1.0)*r + 1.0);
+        else
+            r = r - 5.0;
+            x = (((((((c(9)*r + c(8))*r + c(7))*r + c(6))*r + c(5))*r + ...
+                   c(4))*r + c(3))*r + c(2))*r + c(1)) / ...
+                ((r + 1.0)*r + 1.0);
+        end
+        
+        if y < 0
+            x = -x;
+        end
+    end
+end
+
+% Normal PDF (replaces normpdf)
+function p = normpdf_custom(x, mu, sigma)
+    p = (1/(sigma*sqrt(2*pi))) * exp(-0.5*((x-mu)/sigma).^2);
+end
+
+% Manual discrete-time conversion (replaces c2d)
+function [Ad, Bd] = c2d_manual(A, B, Ts)
+    % Zero-order hold discretization
+    % Ad = e^(A*Ts)
+    % Bd = A^(-1) * (Ad - I) * B
+    
+    n = size(A, 1);
+    
+    % Matrix exponential using Padé approximation
+    Ad = expm(A * Ts);
+    
+    % Compute Bd
+    if rcond(A) > 1e-10
+        Bd = (A \ (Ad - eye(n))) * B;
+    else
+        % If A is near-singular, use series approximation
+        Bd = Ts * B;
+        term = Ts * B;
+        for k = 1:10
+            term = (A * term) * Ts / (k + 1);
+            Bd = Bd + term;
+            if norm(term) < 1e-10
+                break;
+            end
+        end
+    end
+end
+
+% Cholesky decomposition (base MATLAB has this, but let's verify)
+function L = chol_lower(A)
+    [L_upper, p] = chol(A);
+    if p ~= 0
+        error('Matrix is not positive definite');
+    end
+    L = L_upper';
+end
+
+%% ========================================================================
+%  SECTION 2: STATE-SPACE MODEL DEFINITION
+%  ========================================================================
+
+% Aircraft Longitudinal Dynamics
+A = [-0.313  56.7    0;
+     -0.0139 -0.426  0; 
+      0      56.7    0];
+     
+B = [0.232;
+     0.0203; 
+     0];
+     
+C = [0 0 1];
+D = 0;
+Ts = 0.01;  % 100 Hz sampling
+
+% Manual discrete-time conversion
+[Ad, Bd] = c2d_manual(A, B, Ts);
+Cd = C;
+
+fprintf('State-Space Model Parameters:\n');
+fprintf('  Sampling Rate: %.0f Hz\n', 1/Ts);
+fprintf('  System Order: %d states\n', size(A,1));
+fprintf('  Discrete-time system: CREATED (manual conversion)\n\n');
+
+%% ========================================================================
+%  SECTION 3: SIMULATION PARAMETERS
+%  ========================================================================
+
+t_end = 10;
+t = 0:Ts:t_end; 
+N = length(t);
+
+u = 0.1 * ones(1, N);
+
+% Kalman Filter Parameters
+Q = eye(3) * 0.001;
+R = 0.01;
+L_Q = chol_lower(Q);
+
+% Initialize states
+x_true = [0; 0; 0];
+x_hat = [0; 0; 0];
+P = eye(3);
+
+fprintf('Noise Model:\n');
+fprintf('  Process noise (Q): %.4f (per state)\n', Q(1,1));
+fprintf('  Measurement noise (R): %.4f\n', R);
+fprintf('  Initial covariance trace: %.4f\n\n', trace(P));
+
+%% ========================================================================
+%  SECTION 4: DETECTION PARAMETERS
+%  ========================================================================
+
+window_len = 15;
+resid_window = zeros(1, window_len);
+
+% Chi-Squared (manual calculation)
+chi2_confidence = 0.99;
+chi2_threshold = chi2inv_custom(chi2_confidence, window_len);
+
+% CUSUM
+cusum_threshold = 5.0;
+cusum_drift = 0.5;
+cusum_pos = 0;
+cusum_neg = 0;
+
+% SPRT
+sprt_alpha = 0.01;
+sprt_beta = 0.01;
+sprt_A = (1 - sprt_beta) / sprt_alpha;
+sprt_B = sprt_beta / (1 - sprt_alpha);
+sprt_llr = 0;
+
+% GLRT
+glrt_window = 20;
+glrt_threshold = chi2inv_custom(0.99, 1);
+
+% Mahalanobis
+mahalanobis_threshold = 3.0;
+
+% Fusion weights
+fusion_weights = [0.25; 0.25; 0.20; 0.15; 0.15];
+fusion_threshold = 0.6;
+
+fprintf('Detection Algorithms Configured:\n');
+fprintf('  1. Chi-Squared: window=%d, threshold=%.2f\n', window_len, chi2_threshold);
+fprintf('  2. CUSUM: threshold=%.1f, drift=%.1f\n', cusum_threshold, cusum_drift);
+fprintf('  3. SPRT: alpha=%.3f, beta=%.3f\n', sprt_alpha, sprt_beta);
+fprintf('  4. GLRT: window=%d, threshold=%.2f\n', glrt_window, glrt_threshold);
+fprintf('  5. Mahalanobis: threshold=%.1f-sigma\n', mahalanobis_threshold);
+fprintf('  6. Fusion: threshold=%.2f\n\n', fusion_threshold);
+
+%% ========================================================================
+%  SECTION 5: FAULT SCENARIOS
+%  ========================================================================
+
+fault_scenarios = struct();
+fault_scenarios.glitch_start = 200;
+fault_scenarios.glitch_end = 205;
+fault_scenarios.glitch_magnitude = 5.0;
+fault_scenarios.drift_start = 400;
+fault_scenarios.drift_end = 600;
+fault_scenarios.drift_rate = 0.01;
+fault_scenarios.bias_start = 700;
+fault_scenarios.bias_end = 850;
+fault_scenarios.bias_magnitude = 2.5;
+
+fprintf('Fault Injection Schedule:\n');
+fprintf('  Glitch:     t=[%.1f, %.1f]s, magnitude=%.1f\n', ...
+    fault_scenarios.glitch_start*Ts, fault_scenarios.glitch_end*Ts, fault_scenarios.glitch_magnitude);
+fprintf('  Drift:      t=[%.1f, %.1f]s, rate=%.3f/sample\n', ...
+    fault_scenarios.drift_start*Ts, fault_scenarios.drift_end*Ts, fault_scenarios.drift_rate);
+fprintf('  Bias:       t=[%.1f, %.1f]s, magnitude=%.1f\n\n', ...
+    fault_scenarios.bias_start*Ts, fault_scenarios.bias_end*Ts, fault_scenarios.bias_magnitude);
+
+%% ========================================================================
+%  SECTION 6: PREALLOCATE STORAGE
+%  ========================================================================
+
+raw_y = zeros(1, N);
+est_y = zeros(1, N);
+true_y = zeros(1, N);
+innovation_seq = zeros(1, N);
+resid_normalized = zeros(1, N);
+mahalanobis_dist = zeros(1, N);
+
+fault_chi2 = zeros(1, N);
+fault_cusum = zeros(1, N);
+fault_glrt = zeros(1, N);
+fault_sprt = zeros(1, N);
+fault_mahalanobis = zeros(1, N);
+fault_fusion = zeros(1, N);
+
+chi2_stat_log = zeros(1, N);
+cusum_stat_log = zeros(1, N);
+glrt_stat_log = zeros(1, N);
+sprt_stat_log = zeros(1, N);
+
+kalman_gain_norm = zeros(1, N);
+P_trace = zeros(1, N);
+innovation_cov = zeros(1, N);
+
+transmitted_flags = zeros(1, N);
+compression_bits = zeros(1, N);
+
+fprintf('Memory Allocated: %d samples\n\n', N);
+
+%% ========================================================================
+%  SECTION 7: MAIN SIMULATION LOOP
+%  ========================================================================
+
+fprintf('Starting Real-Time Simulation...\n');
+tic;
+
+for k = 1:N
+    
+    %% True System Simulation
+    w_process = L_Q * randn(3, 1);
+    x_true = Ad * x_true + Bd * u(k) + w_process;
+    v_sensor = sqrt(R) * randn;
+    y_meas = Cd * x_true + v_sensor;
+    
+    % INJECT FAULTS
+    if k >= fault_scenarios.glitch_start && k <= fault_scenarios.glitch_end
+        y_meas = y_meas + fault_scenarios.glitch_magnitude;
+    end
+    
+    if k >= fault_scenarios.drift_start && k <= fault_scenarios.drift_end
+        drift_amount = fault_scenarios.drift_rate * (k - fault_scenarios.drift_start);
+        y_meas = y_meas + drift_amount;
+    end
+    
+    if k >= fault_scenarios.bias_start && k <= fault_scenarios.bias_end
+        y_meas = y_meas + fault_scenarios.bias_magnitude;
+    end
+    
+    %% Kalman Filter
+    % Prediction
+    x_pred = Ad * x_hat + Bd * u(k);
+    P_pred = Ad * P * Ad' + Q;
+    
+    % Update
+    innovation = y_meas - Cd * x_pred;
+    S = Cd * P_pred * Cd' + R;
+    K = P_pred * Cd' / S;
+    x_hat = x_pred + K * innovation;
+    
+    % Joseph form for numerical stability
+    I_KC = eye(3) - K * Cd;
+    P = I_KC * P_pred * I_KC' + K * R * K';
+    
+    %% Store Results
+    raw_y(k) = y_meas;
+    est_y(k) = Cd * x_hat;
+    true_y(k) = Cd * x_true;
+    innovation_seq(k) = innovation;
+    resid_normalized(k) = innovation / sqrt(S);
+    mahalanobis_dist(k) = abs(innovation) / sqrt(S);
+    kalman_gain_norm(k) = norm(K);
+    P_trace(k) = trace(P);
+    innovation_cov(k) = S;
+    
+    %% DETECTION ALGORITHMS
+    
+    % 1. Chi-Squared Test
+    resid_window = [resid_window(2:end), innovation^2 / S];
+    if k >= window_len
+        chi2_stat = sum(resid_window);
+        chi2_stat_log(k) = chi2_stat;
+        if chi2_stat > chi2_threshold
+            fault_chi2(k) = 1;
+        end
+    end
+    
+    % 2. CUSUM
+    z = resid_normalized(k);
+    cusum_pos = max(0, cusum_pos + z - cusum_drift);
+    cusum_neg = max(0, cusum_neg - z - cusum_drift);
+    cusum_stat = max(cusum_pos, cusum_neg);
+    cusum_stat_log(k) = cusum_stat;
+    
+    if cusum_stat > cusum_threshold
+        fault_cusum(k) = 1;
+        cusum_pos = 0;
+        cusum_neg = 0;
+    end
+    
+    % 3. GLRT
+    if k >= glrt_window
+        recent_innov = innovation_seq(k - glrt_window + 1 : k);
+        innov_mean = mean(recent_innov);
+        innov_var = mean(innovation_cov(k - glrt_window + 1 : k));
+        glrt_stat = (glrt_window * innov_mean^2) / innov_var;
+        glrt_stat_log(k) = glrt_stat;
+        
+        if glrt_stat > glrt_threshold
+            fault_glrt(k) = 1;
+        end
+    end
+    
+    % 4. SPRT
+    delta = 2.0;
+    sprt_llr = sprt_llr + resid_normalized(k) * delta - delta^2 / 2;
+    sprt_stat_log(k) = sprt_llr;
+    
+    if sprt_llr >= log(sprt_A)
+        fault_sprt(k) = 1;
+        sprt_llr = 0;
+    elseif sprt_llr <= log(sprt_B)
+        sprt_llr = 0;
+    end
+    
+    % 5. Mahalanobis Distance
+    if mahalanobis_dist(k) > mahalanobis_threshold
+        fault_mahalanobis(k) = 1;
+    end
+    
+    % 6. Multi-Method Fusion
+    detection_vector = [fault_chi2(k); fault_cusum(k); fault_glrt(k); 
+                        fault_sprt(k); fault_mahalanobis(k)];
+    fusion_score = sum(detection_vector .* fusion_weights);
+    
+    if fusion_score >= fusion_threshold
+        fault_fusion(k) = 1;
+    end
+    
+    %% ADAPTIVE COMPRESSION
+    transmit_condition = false;
+    
+    % Condition 1: Fault detected
+    if fault_fusion(k) == 1
+        transmit_condition = true;
+    end
+    
+    % Condition 2: Significant change
+    if k > 1
+        last_transmitted_idx = find(transmitted_flags(1:k-1), 1, 'last');
+        if ~isempty(last_transmitted_idx)
+            change_magnitude = abs(raw_y(k) - raw_y(last_transmitted_idx));
+            if change_magnitude > 0.05
+                transmit_condition = true;
+            end
+        end
+    end
+    
+    % Condition 3: Periodic
+    if mod(k, 50) == 0
+        transmit_condition = true;
+    end
+    
+    transmitted_flags(k) = transmit_condition;
+    
+    if transmit_condition
+        compression_bits(k) = 32;
+    else
+        compression_bits(k) = 1;
+    end
+    
+end
+
+simulation_time = toc;
+fprintf('Simulation Complete: %.3f seconds (%.1fx real-time)\n\n', ...
+    simulation_time, t_end / simulation_time);
+
+%% ========================================================================
+%  SECTION 8: PERFORMANCE ANALYSIS
+%  ========================================================================
+
+fprintf('========================================\n');
+fprintf('PERFORMANCE ANALYSIS\n');
+fprintf('========================================\n\n');
+
+% Ground truth
+ground_truth = zeros(1, N);
+ground_truth(fault_scenarios.glitch_start:fault_scenarios.glitch_end) = 1;
+ground_truth(fault_scenarios.drift_start:fault_scenarios.drift_end) = 1;
+ground_truth(fault_scenarios.bias_start:fault_scenarios.bias_end) = 1;
+
+% Calculate metrics
+methods = {'Chi_Squared', 'CUSUM', 'GLRT', 'SPRT', 'Mahalanobis', 'Fusion'};
+methods_display = {'Chi-Squared', 'CUSUM', 'GLRT', 'SPRT', 'Mahalanobis', 'Fusion'};
+detections = {fault_chi2, fault_cusum, fault_glrt, fault_sprt, fault_mahalanobis, fault_fusion};
+
+detection_metrics = struct();
+
+for m = 1:length(methods)
+    detected = detections{m};
+    
+    TP = sum(detected & ground_truth);
+    FP = sum(detected & ~ground_truth);
+    TN = sum(~detected & ~ground_truth);
+    FN = sum(~detected & ground_truth);
+    
+    detection_metrics.(methods{m}).TP = TP;
+    detection_metrics.(methods{m}).FP = FP;
+    detection_metrics.(methods{m}).TN = TN;
+    detection_metrics.(methods{m}).FN = FN;
+    detection_metrics.(methods{m}).Accuracy = (TP + TN) / N;
+    detection_metrics.(methods{m}).Precision = TP / max(TP + FP, 1);
+    detection_metrics.(methods{m}).Recall = TP / max(TP + FN, 1);
+    detection_metrics.(methods{m}).F1 = 2 * (detection_metrics.(methods{m}).Precision * ...
+                                             detection_metrics.(methods{m}).Recall) / ...
+                                        max(detection_metrics.(methods{m}).Precision + ...
+                                            detection_metrics.(methods{m}).Recall, eps);
+    detection_metrics.(methods{m}).FalseAlarmRate = FP / max(FP + TN, 1);
+    
+    % Latency
+    fault_starts = [fault_scenarios.glitch_start, ...
+                    fault_scenarios.drift_start, ...
+                    fault_scenarios.bias_start];
+    latencies = [];
+    for fs = fault_starts
+        first_detect = find(detected(fs:end), 1, 'first');
+        if ~isempty(first_detect)
+            latencies = [latencies, (first_detect - 1) * Ts];
+        end
+    end
+    detection_metrics.(methods{m}).AvgLatency = mean(latencies);
+end
+
+% Print results
+fprintf('--- Detection Performance ---\n');
+fprintf('%-15s | Acc    | Prec   | Recall | F1     | FAR    | Latency(ms)\n', 'Method');
+fprintf('----------------|--------|--------|--------|--------|--------|------------\n');
+for m = 1:length(methods)
+    dm = detection_metrics.(methods{m});
+    fprintf('%-15s | %.3f  | %.3f  | %.3f  | %.3f  | %.4f | %.1f\n', ...
+        methods_display{m}, dm.Accuracy, dm.Precision, dm.Recall, dm.F1, ...
+        dm.FalseAlarmRate, dm.AvgLatency * 1000);
+end
+fprintf('\n');
+
+% Compression analysis
+total_bits_raw = N * 32;
+total_bits_compressed = sum(compression_bits);
+compression_ratio = (1 - total_bits_compressed / total_bits_raw) * 100;
+
+fprintf('--- Compression Performance ---\n');
+fprintf('Raw transmission:        %d bits\n', total_bits_raw);
+fprintf('Compressed transmission: %d bits\n', total_bits_compressed);
+fprintf('Compression ratio:       %.2f%%\n', compression_ratio);
+fprintf('Samples transmitted:     %d / %d (%.1f%%)\n', ...
+    sum(transmitted_flags), N, sum(transmitted_flags)/N*100);
+fprintf('\n');
+
+% Estimation accuracy
+estimation_error = raw_y - est_y;
+rmse = sqrt(mean(estimation_error.^2));
+mae = mean(abs(estimation_error));
+
+fprintf('--- Estimation Accuracy ---\n');
+fprintf('RMSE:       %.6f\n', rmse);
+fprintf('MAE:        %.6f\n', mae);
+fprintf('Avg P trace: %.6f\n', mean(P_trace));
+fprintf('\n');
+
+%% ========================================================================
+%  SECTION 9: VISUALIZATION
+%  ========================================================================
+
+fprintf('Generating comprehensive visualizations...\n');
+
+% Extract metrics for plotting
+accuracy_vals = zeros(1, 6);
+precision_vals = zeros(1, 6);
+recall_vals = zeros(1, 6);
+f1_vals = zeros(1, 6);
+far_vals = zeros(1, 6);
+latency_vals = zeros(1, 6);
+
+for m = 1:6
+    accuracy_vals(m) = detection_metrics.(methods{m}).Accuracy;
+    precision_vals(m) = detection_metrics.(methods{m}).Precision;
+    recall_vals(m) = detection_metrics.(methods{m}).Recall;
+    f1_vals(m) = detection_metrics.(methods{m}).F1;
+    far_vals(m) = detection_metrics.(methods{m}).FalseAlarmRate;
+    latency_vals(m) = detection_metrics.(methods{m}).AvgLatency * 1000;
+end
+
+%% Figure 1: Main System Overview
+figure('Position', [50 50 1600 1000], 'Name', 'System Overview');
+
+subplot(2,2,1);
+plot(t, true_y, 'g-', 'LineWidth', 1, 'DisplayName', 'True Output'); hold on;
+plot(t, raw_y, 'b-', 'LineWidth', 1, 'DisplayName', 'Measured (with faults)');
+plot(t, est_y, 'r--', 'LineWidth', 1.5, 'DisplayName', 'Kalman Estimate');
+fault_times = t(fault_fusion == 1);
+fault_vals = raw_y(fault_fusion == 1);
+scatter(fault_times, fault_vals, 50, 'k', 'filled', 'DisplayName', 'Fusion Detection');
+xlabel('Time (s)'); ylabel('Pitch Angle (rad)');
+title('System Measurements and Kalman Filter Estimates');
+legend('Location', 'best');
+grid on;
+
+subplot(2,2,2);
+plot(t, innovation_seq, 'k-', 'LineWidth', 1); hold on;
+plot(t, 3*sqrt(innovation_cov), 'r--', 'LineWidth', 1.5);
+plot(t, -3*sqrt(innovation_cov), 'r--', 'LineWidth', 1.5);
+xlabel('Time (s)'); ylabel('Innovation');
+title('Kalman Filter Innovation Sequence (±3σ bounds)');
+legend('Innovation', '±3σ bounds', 'Location', 'best');
+grid on;
+
+subplot(2,2,3);
+plot(t, mahalanobis_dist, 'b-', 'LineWidth', 1.5); hold on;
+plot(t, mahalanobis_threshold * ones(size(t)), 'r--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Mahalanobis Distance');
+title('Normalized Innovation (Mahalanobis Distance)');
+legend('Distance', sprintf('Threshold (%.1f\\sigma)', mahalanobis_threshold), 'Location', 'best');
+grid on;
+
+subplot(2,2,4);
+plot(t, P_trace, 'b-', 'LineWidth', 1.5);
+xlabel('Time (s)'); ylabel('Trace(P)');
+title('Kalman Filter Covariance Trace');
+grid on;
+
+%% Figure 2: Detection Methods Comparison
+figure('Position', [100 100 1600 1000], 'Name', 'Detection Methods');
+
+for m = 1:6
+    subplot(3,2,m);
+    plot(t, detections{m}, 'LineWidth', 2); hold on;
+    plot(t, ground_truth, 'r--', 'LineWidth', 1);
+    ylim([-0.1 1.2]);
+    xlabel('Time (s)'); ylabel('Detection Flag');
+    title(sprintf('%s (Acc: %.2f%%, FAR: %.2f%%)', ...
+        methods_display{m}, detection_metrics.(methods{m}).Accuracy*100, ...
+        detection_metrics.(methods{m}).FalseAlarmRate*100));
+    legend('Detected', 'Ground Truth', 'Location', 'best');
+    grid on;
+end
+
+%% Figure 3: Performance Metrics Comparison
+figure('Position', [150 150 1600 900], 'Name', 'Performance Metrics');
+
+subplot(2,3,1);
+bar(accuracy_vals * 100, 'FaceColor', [0.2 0.6 0.8]);
+set(gca, 'XTickLabel', methods_display, 'XTickLabelRotation', 45);
+ylabel('Accuracy (%)');
+title('Detection Accuracy');
+ylim([90 100]);
+grid on;
+
+subplot(2,3,2);
+bar(precision_vals * 100, 'FaceColor', [0.8 0.4 0.2]);
+set(gca, 'XTickLabel', methods_display, 'XTickLabelRotation', 45);
+ylabel('Precision (%)');
+title('Detection Precision');
+ylim([0 100]);
+grid on;
+
+subplot(2,3,3);
+bar(recall_vals * 100, 'FaceColor', [0.4 0.8 0.2]);
+set(gca, 'XTickLabel', methods_display, 'XTickLabelRotation', 45);
+ylabel('Recall (%)');
+title('Detection Recall');
+ylim([0 100]);
+grid on;
+
+subplot(2,3,4);
+bar(f1_vals * 100, 'FaceColor', [0.8 0.2 0.6]);
+set(gca, 'XTickLabel', methods_display, 'XTickLabelRotation', 45);
+ylabel('F1 Score (%)');
+title('F1 Score');
+ylim([0 100]);
+grid on;
+
+subplot(2,3,5);
+bar(far_vals * 100, 'FaceColor', [0.9 0.3 0.3]);
+set(gca, 'XTickLabel', methods_display, 'XTickLabelRotation', 45);
+ylabel('False Alarm Rate (%)');
+title('False Alarm Rate');
+grid on;
+
+subplot(2,3,6);
+bar(latency_vals, 'FaceColor', [0.5 0.5 0.8]);
+set(gca, 'XTickLabel', methods_display, 'XTickLabelRotation', 45);
+ylabel('Latency (ms)');
+title('Detection Latency');
+grid on;
+
+%% Figure 4: Compression Analysis
+figure('Position', [200 200 1400 800], 'Name', 'Compression Analysis');
+
+subplot(2,2,1);
+area(t, transmitted_flags * 32, 'FaceColor', [0.3 0.7 0.9]); hold on;
+plot(t, ones(size(t)), 'r-', 'LineWidth', 1);
+xlabel('Time (s)'); ylabel('Bits per Sample');
+title('Adaptive Transmission Strategy');
+legend('Transmitted Bits', 'Minimum', 'Location', 'best');
+grid on;
+
+subplot(2,2,2);
+cumulative_bits = cumsum(compression_bits);
+cumulative_raw = (1:N) * 32;
+plot(t, cumulative_bits/1000, 'b-', 'LineWidth', 2); hold on;
+plot(t, cumulative_raw/1000, 'r--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Cumulative Data (kbits)');
+title(sprintf('Data Transmission: %.1f%% Compression', compression_ratio));
+legend('Compressed', 'Raw', 'Location', 'best');
+grid on;
+
+subplot(2,2,3);
+histogram(innovation_seq, 50, 'Normalization', 'probability');
+hold on;
+x_range = linspace(min(innovation_seq), max(innovation_seq), 200);
+y_theoretical = normpdf_custom(x_range, 0, sqrt(mean(innovation_cov)));
+y_theoretical = y_theoretical / sum(y_theoretical) * (max(innovation_seq) - min(innovation_seq)) / 50;
+plot(x_range, y_theoretical, 'r-', 'LineWidth', 2);
+xlabel('Innovation Value'); ylabel('Probability');
+title('Innovation Distribution');
+legend('Actual', 'Theoretical', 'Location', 'best');
+grid on;
+
+subplot(2,2,4);
+categories = {'Raw', 'Compressed'};
+bandwidth_vals = [total_bits_raw, total_bits_compressed]/1000;
+bar(bandwidth_vals);
+set(gca, 'XTickLabel', categories);
+ylabel('Total Data (kbits)');
+title(sprintf('Bandwidth Comparison (%.1f%% Saved)', compression_ratio));
+grid on;
+
+%% Figure 5: Statistical Analysis
+figure('Position', [250 250 1600 800], 'Name', 'Statistical Analysis');
+
+subplot(2,2,1);
+plot(t, chi2_stat_log, 'b-', 'LineWidth', 1); hold on;
+plot(t, chi2_threshold * ones(size(t)), 'r--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Chi-Squared Statistic');
+title('Chi-Squared Test');
+legend('Statistic', 'Threshold', 'Location', 'best');
+grid on;
+
+subplot(2,2,2);
+plot(t, cusum_stat_log, 'b-', 'LineWidth', 1); hold on;
+plot(t, cusum_threshold * ones(size(t)), 'r--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('CUSUM Statistic');
+title('CUSUM Test');
+legend('Statistic', 'Threshold', 'Location', 'best');
+grid on;
+
+subplot(2,2,3);
+plot(t, glrt_stat_log, 'b-', 'LineWidth', 1); hold on;
+plot(t, glrt_threshold * ones(size(t)), 'r--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('GLRT Statistic');
+title('GLRT Test');
+legend('Statistic', 'Threshold', 'Location', 'best');
+grid on;
+
+subplot(2,2,4);
+plot(t, sprt_stat_log, 'b-', 'LineWidth', 1); hold on;
+plot(t, log(sprt_A) * ones(size(t)), 'r--', 'LineWidth', 2);
+plot(t, log(sprt_B) * ones(size(t)), 'g--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Log-Likelihood Ratio');
+title('SPRT Test');
+legend('LLR', 'Upper', 'Lower', 'Location', 'best');
+grid on;
+
+%% Figure 6: Summary Dashboard
+figure('Position', [300 300 1400 900], 'Name', 'PATENT SUMMARY DASHBOARD');
+set(gcf, 'Color', 'w');
+
+subplot(3,3,[1 2]);
+text(0.1, 0.9, 'INTELLIGENT ADAPTIVE TELEMETRY SYSTEM', 'FontSize', 16, 'FontWeight', 'bold');
+text(0.1, 0.75, 'PATENT-READY AEROSPACE ANOMALY DETECTION', 'FontSize', 14, 'FontWeight', 'bold');
+text(0.1, 0.6, sprintf('Compression Ratio: %.1f%%', compression_ratio), 'FontSize', 12);
+text(0.1, 0.5, sprintf('Best Method: %s (F1: %.3f)', methods_display{find(f1_vals == max(f1_vals), 1)}, max(f1_vals)), 'FontSize', 12);
+text(0.1, 0.4, sprintf('Avg Detection Latency: %.1f ms', mean(latency_vals)), 'FontSize', 12);
+text(0.1, 0.3, sprintf('False Alarm Rate: %.2f%%', detection_metrics.Fusion.FalseAlarmRate*100), 'FontSize', 12);
+text(0.1, 0.2, sprintf('Real-Time Factor: %.1fx', t_end / simulation_time), 'FontSize', 12);
+text(0.1, 0.1, sprintf('Estimation RMSE: %.6f', rmse), 'FontSize', 12);
+axis off;
+
+subplot(3,3,3);
+% Pie chart for bandwidth
+pie([compression_ratio, 100-compression_ratio], ...
+    {sprintf('Saved\n%.1f%%', compression_ratio), sprintf('Used\n%.1f%%', 100-compression_ratio)});
+title('Bandwidth Efficiency');
+
+subplot(3,3,[4 5 6]);
+bar(1:6, [accuracy_vals; precision_vals; recall_vals; f1_vals]' * 100);
+set(gca, 'XTickLabel', methods_display, 'XTickLabelRotation', 45);
+ylabel('Score (%)');
+title('Multi-Metric Performance Comparison');
+legend('Accuracy', 'Precision', 'Recall', 'F1', 'Location', 'best');
+grid on;
+
+subplot(3,3,7);
+imagesc([fault_chi2; fault_cusum; fault_glrt; fault_sprt; fault_mahalanobis; fault_fusion]);
+colormap(gca, [1 1 1; 0.8 0.2 0.2]);
+set(gca, 'YTick', 1:6, 'YTickLabel', methods_display);
+xlabel('Sample Index');
+title('Detection Timeline Heatmap');
+colorbar('Ticks', [0 1], 'TickLabels', {'No Fault', 'Fault'});
+
+subplot(3,3,8);
+detection_counts = [detection_metrics.Chi_Squared.TP, ...
+                    detection_metrics.CUSUM.TP, ...
+                    detection_metrics.GLRT.TP, ...
+                    detection_metrics.SPRT.TP, ...
+                    detection_metrics.Mahalanobis.TP, ...
+                    detection_metrics.Fusion.TP];
+pie(detection_counts, methods_display);
+title('True Positive Distribution');
+
+subplot(3,3,9);
+plot(t, estimation_error, 'b-', 'LineWidth', 1);
+xlabel('Time (s)'); ylabel('Error');
+title(sprintf('Estimation Error (RMSE: %.4f)', rmse));
+grid on;
+
+%% ========================================================================
+%  SECTION 10: PATENT DOCUMENTATION
+%  ========================================================================
+
+fprintf('========================================\n');
+fprintf('PATENT CLAIMS SUMMARY\n');
+fprintf('========================================\n\n');
+
+fprintf('CLAIM 1 - Primary Invention:\n');
+fprintf('Multi-algorithm fusion for aerospace telemetry\n');
+fprintf('  Performance: %.1f%% compression, %.1f ms latency\n\n', ...
+    compression_ratio, mean(latency_vals));
+
+fprintf('CLAIM 2 - Detection Fusion:\n');
+fprintf('  Achieves F1 score: %.3f, FAR: %.2f%%\n\n', ...
+    detection_metrics.Fusion.F1, detection_metrics.Fusion.FalseAlarmRate*100);
+
+fprintf('CLAIM 3 - Adaptive Compression:\n');
+fprintf('  Bandwidth savings: %.1f%%\n\n', compression_ratio);
+
+fprintf('========================================\n');
+fprintf('COMPARISON TABLE:\n');
+fprintf('========================================\n');
+fprintf('%-20s | %-10s | %-10s | %-10s\n', 'Metric', 'Chi-Sq', 'Fusion', 'Improvement');
+fprintf('---------------------|------------|------------|------------\n');
+fprintf('%-20s | %9.2f%% | %9.2f%% | %+9.2f%%\n', 'Accuracy', ...
+    detection_metrics.Chi_Squared.Accuracy*100, ...
+    detection_metrics.Fusion.Accuracy*100, ...
+    (detection_metrics.Fusion.Accuracy - detection_metrics.Chi_Squared.Accuracy)*100);
+fprintf('%-20s | %9.2f%% | %9.2f%% | %+9.2f%%\n', 'F1 Score', ...
+    detection_metrics.Chi_Squared.F1*100, ...
+    detection_metrics.Fusion.F1*100, ...
+    (detection_metrics.Fusion.F1 - detection_metrics.Chi_Squared.F1)*100);
+fprintf('%-20s | %8.1fms | %8.1fms | %+8.1fms\n', 'Latency', ...
+    detection_metrics.Chi_Squared.AvgLatency*1000, ...
+    detection_metrics.Fusion.AvgLatency*1000, ...
+    (detection_metrics.Fusion.AvgLatency - detection_metrics.Chi_Squared.AvgLatency)*1000);
+
+fprintf('\n*** Patent-ready implementation complete ***\n');
+fprintf('*** NO TOOLBOXES REQUIRED ***\n');
