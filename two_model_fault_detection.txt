@@ -1,0 +1,587 @@
+%% ========================================================================
+%  TWO-MODEL FAULT DETECTION SYSTEM
+%  In-Air Aircraft vs On-Ground Reference Model
+%  ========================================================================
+%
+%  CONCEPT:
+%  - In-Air Aircraft: Flying aircraft with potential sensor faults
+%  - On-Ground Reference: Clean baseline model without faults
+%  - Difference reveals ONLY the fault (common signals cancel out)
+%  - Detect and classify: Glitch vs Persistent Fault
+%
+%  PHYSICAL MEANING OF VARIABLES:
+%  - theta: Pitch angle (output we measure, in radians)
+%  - elevator: Control surface deflection (input, in radians)
+%  - velocity_forward: Forward velocity component (state)
+%  - velocity_vertical: Vertical velocity component (state)  
+%  - pitch_rate: Angular velocity about pitch axis (state)
+%
+%% ========================================================================
+
+clear; clc; close all;
+
+fprintf('================================================\n');
+fprintf('TWO-MODEL FAULT DETECTION SYSTEM\n');
+fprintf('In-Air Aircraft vs On-Ground Reference\n');
+fprintf('================================================\n\n');
+
+%% ========================================================================
+%  SECTION 1: AIRCRAFT STATE-SPACE MODELS
+%% ========================================================================
+
+fprintf('Defining aircraft dynamics...\n');
+
+% State vector: [velocity_forward; velocity_vertical; pitch_rate]
+% Input: elevator deflection (control surface)
+% Output: theta (pitch angle)
+
+% IN-AIR AIRCRAFT MODEL (will receive faults)
+A_inair = [-0.313  56.7    0; 
+           -0.0139 -0.426  0; 
+            0      56.7    0];
+B_inair = [0.232; 0.0203; 0];
+C_inair = [0 0 1];  % Measure pitch angle from pitch_rate
+D_inair = 0;
+
+% ON-GROUND REFERENCE MODEL (clean baseline, no faults)
+A_ground = [-0.313  56.7    0; 
+            -0.0139 -0.426  0; 
+             0      56.7    0];
+B_ground = [0.232; 0.0203; 0];
+C_ground = [0 0 1];
+D_ground = 0;
+
+% Sampling time
+sampling_time = 0.01;  % 10ms = 100 Hz
+sampling_freq = 1 / sampling_time;
+
+fprintf('  Aircraft states: velocity_forward, velocity_vertical, pitch_rate\n');
+fprintf('  Control input: elevator deflection\n');
+fprintf('  Measured output: theta (pitch angle)\n');
+fprintf('  Sampling Rate: %.0f Hz\n\n', sampling_freq);
+
+%% ========================================================================
+%  SECTION 2: CONVERT TO DISCRETE-TIME (for digital implementation)
+%% ========================================================================
+
+fprintf('Converting continuous dynamics to discrete-time...\n');
+
+% In-Air model discretization
+A_inair_discrete = expm(A_inair * sampling_time);
+if rcond(A_inair) > 1e-10
+    B_inair_discrete = (A_inair \ (A_inair_discrete - eye(3))) * B_inair;
+else
+    B_inair_discrete = sampling_time * B_inair;
+end
+C_inair_discrete = C_inair;
+
+% On-Ground model discretization
+A_ground_discrete = expm(A_ground * sampling_time);
+if rcond(A_ground) > 1e-10
+    B_ground_discrete = (A_ground \ (A_ground_discrete - eye(3))) * B_ground;
+else
+    B_ground_discrete = sampling_time * B_ground;
+end
+C_ground_discrete = C_ground;
+
+fprintf('  Discrete-time conversion: COMPLETE\n\n');
+
+%% ========================================================================
+%  SECTION 3: SIMULATION TIME PARAMETERS
+%% ========================================================================
+
+% Time settings
+simulation_duration = 5;  % 5 seconds total
+time = 0:sampling_time:simulation_duration;
+num_samples = length(time);
+
+fprintf('Simulation Configuration:\n');
+fprintf('  Total duration: %.0f seconds\n', simulation_duration);
+fprintf('  Number of samples: %d\n', num_samples);
+fprintf('  Time resolution: %.0f ms\n\n', sampling_time * 1000);
+
+% Control input: elevator deflection (constant for simplicity)
+elevator_deflection = 0.1 * ones(1, num_samples);  % 0.1 radian constant
+
+% Noise characteristics (realistic sensor/process noise)
+process_noise_covariance = eye(3) * 0.001;  % State uncertainty
+sensor_noise_variance = 0.01;               % Measurement uncertainty
+process_noise_chol = chol(process_noise_covariance, 'lower');
+
+%% ========================================================================
+%  SECTION 4: INITIALIZE KALMAN FILTERS FOR BOTH MODELS
+%% ========================================================================
+
+fprintf('Initializing Kalman filters...\n');
+
+% IN-AIR AIRCRAFT - Kalman Filter
+state_inair_true = [0; 0; 0];           % True aircraft state (unknown in practice)
+state_inair_estimate = [0; 0; 0];       % Kalman filter estimate
+covariance_inair = eye(3);              % Estimation error covariance
+
+% ON-GROUND REFERENCE - Kalman Filter  
+state_ground_true = [0; 0; 0];          % True reference state
+state_ground_estimate = [0; 0; 0];      % Kalman filter estimate
+covariance_ground = eye(3);             % Estimation error covariance
+
+fprintf('  In-Air Kalman Filter: INITIALIZED\n');
+fprintf('  On-Ground Kalman Filter: INITIALIZED\n\n');
+
+%% ========================================================================
+%  SECTION 5: FAULT INJECTION CONFIGURATION
+%% ========================================================================
+
+fprintf('Configuring fault injection...\n');
+
+% PERSISTENT FAULT injection parameters
+fault_start_time = 3.0;  % Inject fault at 3 seconds
+fault_start_sample = round(fault_start_time / sampling_time);
+fault_magnitude = 2.5;   % 2.5 radians bias in pitch angle sensor
+
+fprintf('  Fault type: PERSISTENT BIAS\n');
+fprintf('  Injection time: %.1f seconds (sample #%d)\n', fault_start_time, fault_start_sample);
+fprintf('  Fault magnitude: %.1f radians (%.1f degrees)\n', fault_magnitude, rad2deg(fault_magnitude));
+fprintf('  Applied to: In-Air pitch angle sensor\n\n');
+
+%% ========================================================================
+%  SECTION 6: DETECTION ALGORITHM PARAMETERS
+%% ========================================================================
+
+fprintf('Configuring fault detection algorithms...\n');
+
+% WINDOWED CHI-SQUARED TEST parameters
+detection_window_length = 10;  % Use last 10 samples (100ms)
+chi2_confidence_level = 0.99;  % 99% confidence
+chi2_detection_threshold = 21.666;  % Threshold for 10 degrees of freedom
+residual_history_window = zeros(1, detection_window_length);
+
+% ADAPTIVE CUSUM (Cumulative Sum) parameters
+cusum_detection_threshold = 4.0;  % Detection boundary
+cusum_drift_allowance = 0.5;      % Tolerable drift before alarming
+cusum_positive_accumulator = 0;   % Positive deviation accumulator
+cusum_negative_accumulator = 0;   % Negative deviation accumulator
+
+fprintf('  Chi-Squared window: %d samples (%.0f ms)\n', ...
+    detection_window_length, detection_window_length * sampling_time * 1000);
+fprintf('  Chi-Squared threshold: %.2f (%.0f%% confidence)\n', ...
+    chi2_detection_threshold, chi2_confidence_level * 100);
+fprintf('  CUSUM threshold: %.1f\n', cusum_detection_threshold);
+fprintf('  CUSUM drift allowance: %.1f\n\n', cusum_drift_allowance);
+
+%% ========================================================================
+%  SECTION 7: PREALLOCATE STORAGE ARRAYS (for speed)
+%% ========================================================================
+
+fprintf('Allocating memory for data storage...\n');
+
+% IN-AIR AIRCRAFT measurements and estimates
+theta_inair_measured = zeros(1, num_samples);     % Sensor measurement (with fault)
+theta_inair_estimated = zeros(1, num_samples);    % Kalman estimate
+theta_inair_true = zeros(1, num_samples);         % True value (for reference)
+
+% ON-GROUND REFERENCE measurements and estimates
+theta_ground_measured = zeros(1, num_samples);    % Clean measurement (no fault)
+theta_ground_estimated = zeros(1, num_samples);   % Kalman estimate (reference)
+theta_ground_true = zeros(1, num_samples);        % True value
+
+% DIFFERENCE SIGNALS (Key innovation - reveals fault!)
+theta_difference_measured = zeros(1, num_samples);   % Measured difference
+theta_difference_estimated = zeros(1, num_samples);  % Estimated difference
+
+% KALMAN FILTER INNOVATIONS (measurement - prediction)
+innovation_inair = zeros(1, num_samples);         % In-Air innovation
+innovation_ground = zeros(1, num_samples);        % On-Ground innovation
+innovation_difference = zeros(1, num_samples);    % Difference in innovations
+
+% DETECTION FLAGS (binary indicators)
+fault_detected_chi2 = zeros(1, num_samples);      % Chi-Squared detection
+fault_detected_cusum = zeros(1, num_samples);     % CUSUM detection
+fault_detected_combined = zeros(1, num_samples);  % Both methods agree
+
+% DETECTION STATISTICS (for plotting)
+chi2_statistic_log = zeros(1, num_samples);
+cusum_statistic_log = zeros(1, num_samples);
+
+fprintf('  Memory allocated for %d samples\n', num_samples);
+fprintf('  Arrays: 15 signals × %d samples\n\n', num_samples);
+
+%% ========================================================================
+%  SECTION 8: MAIN SIMULATION LOOP (Real-Time Processing)
+%% ========================================================================
+
+fprintf('================================================\n');
+fprintf('STARTING REAL-TIME SIMULATION\n');
+fprintf('================================================\n\n');
+
+tic;  % Start timing
+
+for sample_idx = 1:num_samples
+    
+    current_time = time(sample_idx);
+    
+    %% ===================================================================
+    %  IN-AIR AIRCRAFT SIMULATION (with potential faults)
+    %% ===================================================================
+    
+    % Generate process noise (turbulence, disturbances)
+    process_noise_inair = process_noise_chol * randn(3, 1);
+    
+    % TRUE AIRCRAFT DYNAMICS (physics simulation)
+    state_inair_true = A_inair_discrete * state_inair_true + ...
+                       B_inair_discrete * elevator_deflection(sample_idx) + ...
+                       process_noise_inair;
+    
+    % SENSOR MEASUREMENT (with noise)
+    sensor_noise_inair = sqrt(sensor_noise_variance) * randn;
+    theta_inair_measured(sample_idx) = C_inair_discrete * state_inair_true + sensor_noise_inair;
+    
+    % INJECT FAULT INTO SENSOR (persistent bias after t=3s)
+    if sample_idx >= fault_start_sample
+        theta_inair_measured(sample_idx) = theta_inair_measured(sample_idx) + fault_magnitude;
+    end
+    
+    % KALMAN FILTER - PREDICTION STEP
+    state_inair_predicted = A_inair_discrete * state_inair_estimate + ...
+                           B_inair_discrete * elevator_deflection(sample_idx);
+    covariance_inair_predicted = A_inair_discrete * covariance_inair * A_inair_discrete' + ...
+                                process_noise_covariance;
+    
+    % KALMAN FILTER - UPDATE STEP
+    innovation_inair_current = theta_inair_measured(sample_idx) - ...
+                               C_inair_discrete * state_inair_predicted;
+    innovation_covariance_inair = C_inair_discrete * covariance_inair_predicted * C_inair_discrete' + ...
+                                 sensor_noise_variance;
+    kalman_gain_inair = covariance_inair_predicted * C_inair_discrete' / innovation_covariance_inair;
+    
+    state_inair_estimate = state_inair_predicted + kalman_gain_inair * innovation_inair_current;
+    covariance_inair = (eye(3) - kalman_gain_inair * C_inair_discrete) * covariance_inair_predicted;
+    
+    % Store results
+    theta_inair_estimated(sample_idx) = C_inair_discrete * state_inair_estimate;
+    theta_inair_true(sample_idx) = C_inair_discrete * state_inair_true;
+    innovation_inair(sample_idx) = innovation_inair_current;
+    
+    %% ===================================================================
+    %  ON-GROUND REFERENCE MODEL (clean baseline, NO faults)
+    %% ===================================================================
+    
+    % Generate independent process noise
+    process_noise_ground = process_noise_chol * randn(3, 1);
+    
+    % TRUE REFERENCE DYNAMICS (same physics, different noise)
+    state_ground_true = A_ground_discrete * state_ground_true + ...
+                        B_ground_discrete * elevator_deflection(sample_idx) + ...
+                        process_noise_ground;
+    
+    % SENSOR MEASUREMENT (clean, NO FAULT)
+    sensor_noise_ground = sqrt(sensor_noise_variance) * randn;
+    theta_ground_measured(sample_idx) = C_ground_discrete * state_ground_true + sensor_noise_ground;
+    
+    % KALMAN FILTER - PREDICTION STEP
+    state_ground_predicted = A_ground_discrete * state_ground_estimate + ...
+                            B_ground_discrete * elevator_deflection(sample_idx);
+    covariance_ground_predicted = A_ground_discrete * covariance_ground * A_ground_discrete' + ...
+                                 process_noise_covariance;
+    
+    % KALMAN FILTER - UPDATE STEP
+    innovation_ground_current = theta_ground_measured(sample_idx) - ...
+                                C_ground_discrete * state_ground_predicted;
+    innovation_covariance_ground = C_ground_discrete * covariance_ground_predicted * C_ground_discrete' + ...
+                                  sensor_noise_variance;
+    kalman_gain_ground = covariance_ground_predicted * C_ground_discrete' / innovation_covariance_ground;
+    
+    state_ground_estimate = state_ground_predicted + kalman_gain_ground * innovation_ground_current;
+    covariance_ground = (eye(3) - kalman_gain_ground * C_ground_discrete) * covariance_ground_predicted;
+    
+    % Store results
+    theta_ground_estimated(sample_idx) = C_ground_discrete * state_ground_estimate;
+    theta_ground_true(sample_idx) = C_ground_discrete * state_ground_true;
+    innovation_ground(sample_idx) = innovation_ground_current;
+    
+    %% ===================================================================
+    %  KEY INNOVATION: COMPUTE DIFFERENCE SIGNALS
+    %  (This isolates the fault by canceling common signals!)
+    %% ===================================================================
+    
+    theta_difference_measured(sample_idx) = theta_inair_measured(sample_idx) - ...
+                                            theta_ground_measured(sample_idx);
+    theta_difference_estimated(sample_idx) = theta_inair_estimated(sample_idx) - ...
+                                             theta_ground_estimated(sample_idx);
+    innovation_difference(sample_idx) = innovation_inair(sample_idx) - ...
+                                        innovation_ground(sample_idx);
+    
+    %% ===================================================================
+    %  FAULT DETECTION ALGORITHM 1: WINDOWED CHI-SQUARED TEST
+    %  Tests if recent residuals are statistically abnormal
+    %% ===================================================================
+    
+    % Normalize the innovation difference by combined variance
+    normalized_residual_squared = (innovation_difference(sample_idx))^2 / ...
+                                  (innovation_covariance_inair + innovation_covariance_ground);
+    
+    % Update sliding window
+    residual_history_window = [residual_history_window(2:end), normalized_residual_squared];
+    
+    % Calculate Chi-Squared statistic (sum of normalized squared residuals)
+    if sample_idx >= detection_window_length
+        chi2_current_statistic = sum(residual_history_window);
+        chi2_statistic_log(sample_idx) = chi2_current_statistic;
+        
+        % Decision: declare fault if statistic exceeds threshold
+        if chi2_current_statistic > chi2_detection_threshold
+            fault_detected_chi2(sample_idx) = 1;
+        end
+    end
+    
+    %% ===================================================================
+    %  FAULT DETECTION ALGORITHM 2: ADAPTIVE CUSUM
+    %  Accumulates deviations to detect persistent changes
+    %% ===================================================================
+    
+    % Normalize innovation difference
+    normalized_innovation = innovation_difference(sample_idx) / ...
+                           sqrt(innovation_covariance_inair + innovation_covariance_ground);
+    
+    % Update positive and negative CUSUM accumulators
+    cusum_positive_accumulator = max(0, cusum_positive_accumulator + ...
+                                     normalized_innovation - cusum_drift_allowance);
+    cusum_negative_accumulator = max(0, cusum_negative_accumulator - ...
+                                     normalized_innovation - cusum_drift_allowance);
+    
+    % Take maximum of both directions
+    cusum_current_statistic = max(cusum_positive_accumulator, cusum_negative_accumulator);
+    cusum_statistic_log(sample_idx) = cusum_current_statistic;
+    
+    % Decision: declare fault if CUSUM exceeds threshold
+    if cusum_current_statistic > cusum_detection_threshold
+        fault_detected_cusum(sample_idx) = 1;
+        % Reset accumulators after detection to avoid saturation
+        cusum_positive_accumulator = 0;
+        cusum_negative_accumulator = 0;
+    end
+    
+    %% ===================================================================
+    %  COMBINED DECISION LOGIC (Reduces false alarms)
+    %  Require BOTH methods to agree before declaring fault
+    %% ===================================================================
+    
+    if fault_detected_chi2(sample_idx) == 1 && fault_detected_cusum(sample_idx) == 1
+        fault_detected_combined(sample_idx) = 1;
+    end
+    
+    %% Progress indicator (print every second)
+    if mod(sample_idx, 100) == 0
+        fprintf('  Time = %.2f s (sample %d/%d)\n', current_time, sample_idx, num_samples);
+    end
+    
+end
+
+simulation_elapsed_time = toc;
+
+fprintf('\n================================================\n');
+fprintf('SIMULATION COMPLETE\n');
+fprintf('  Elapsed time: %.3f seconds\n', simulation_elapsed_time);
+fprintf('  Real-time factor: %.1fx faster than real-time\n', simulation_duration / simulation_elapsed_time);
+fprintf('================================================\n\n');
+
+%% ========================================================================
+%  SECTION 9: PERFORMANCE ANALYSIS
+%% ========================================================================
+
+fprintf('================================================\n');
+fprintf('FAULT DETECTION PERFORMANCE ANALYSIS\n');
+fprintf('================================================\n\n');
+
+% Ground truth: when fault was actually present
+fault_actually_present = zeros(1, num_samples);
+fault_actually_present(fault_start_sample:end) = 1;
+
+% Calculate detection metrics for Chi-Squared
+true_positives_chi2 = sum(fault_detected_chi2 & fault_actually_present);
+false_positives_chi2 = sum(fault_detected_chi2 & ~fault_actually_present);
+first_detection_chi2 = find(fault_detected_chi2(fault_start_sample:end), 1, 'first');
+if ~isempty(first_detection_chi2)
+    detection_delay_chi2_ms = first_detection_chi2 * sampling_time * 1000;
+else
+    detection_delay_chi2_ms = inf;
+end
+
+% Calculate detection metrics for CUSUM
+true_positives_cusum = sum(fault_detected_cusum & fault_actually_present);
+false_positives_cusum = sum(fault_detected_cusum & ~fault_actually_present);
+first_detection_cusum = find(fault_detected_cusum(fault_start_sample:end), 1, 'first');
+if ~isempty(first_detection_cusum)
+    detection_delay_cusum_ms = first_detection_cusum * sampling_time * 1000;
+else
+    detection_delay_cusum_ms = inf;
+end
+
+% Calculate detection metrics for Combined
+true_positives_combined = sum(fault_detected_combined & fault_actually_present);
+false_positives_combined = sum(fault_detected_combined & ~fault_actually_present);
+first_detection_combined = find(fault_detected_combined(fault_start_sample:end), 1, 'first');
+if ~isempty(first_detection_combined)
+    detection_delay_combined_ms = first_detection_combined * sampling_time * 1000;
+else
+    detection_delay_combined_ms = inf;
+end
+
+% Print results
+fprintf('CHI-SQUARED TEST RESULTS:\n');
+fprintf('  Correct detections: %d samples\n', true_positives_chi2);
+fprintf('  False alarms: %d samples\n', false_positives_chi2);
+fprintf('  Detection delay: %.0f ms\n\n', detection_delay_chi2_ms);
+
+fprintf('CUSUM TEST RESULTS:\n');
+fprintf('  Correct detections: %d samples\n', true_positives_cusum);
+fprintf('  False alarms: %d samples\n', false_positives_cusum);
+fprintf('  Detection delay: %.0f ms\n\n', detection_delay_cusum_ms);
+
+fprintf('COMBINED DETECTION RESULTS:\n');
+fprintf('  Correct detections: %d samples\n', true_positives_combined);
+fprintf('  False alarms: %d samples (LOWEST!)\n', false_positives_combined);
+fprintf('  Detection delay: %.0f ms\n\n', detection_delay_combined_ms);
+
+% Characterize fault type
+fault_duration_seconds = sum(fault_detected_combined) * sampling_time;
+if fault_duration_seconds > 0.5
+    fault_classification = 'PERSISTENT FAULT';
+else
+    fault_classification = 'GLITCH (brief transient)';
+end
+
+fprintf('FAULT CHARACTERIZATION:\n');
+fprintf('  Classification: %s\n', fault_classification);
+fprintf('  Detected duration: %.2f seconds\n', fault_duration_seconds);
+fprintf('  Average magnitude: %.3f radians (%.1f degrees)\n', ...
+    mean(abs(theta_difference_estimated(fault_start_sample:end))), ...
+    rad2deg(mean(abs(theta_difference_estimated(fault_start_sample:end)))));
+fprintf('\n');
+
+%% ========================================================================
+%  SECTION 10: VISUALIZATION
+%% ========================================================================
+
+fprintf('Generating visualizations...\n\n');
+
+%% FIGURE 1: Complete System Overview
+figure('Position', [50 50 1600 900], 'Name', 'Two-Model Fault Detection System');
+
+% Subplot 1: In-Air Aircraft (with fault)
+subplot(3,2,1);
+plot(time, theta_inair_measured, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, theta_inair_estimated, 'r--', 'LineWidth', 1.5);
+plot([fault_start_time fault_start_time], ylim, 'k--', 'LineWidth', 2);
+xlabel('Time (seconds)'); ylabel('Pitch Angle theta (radians)');
+title('IN-AIR AIRCRAFT (fault injected at t=3s)');
+legend('Sensor Measurement', 'Kalman Estimate', 'Fault Injection Time', 'Location', 'best');
+grid on;
+
+% Subplot 2: On-Ground Reference (no fault)
+subplot(3,2,2);
+plot(time, theta_ground_measured, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, theta_ground_estimated, 'r--', 'LineWidth', 1.5);
+plot([fault_start_time fault_start_time], ylim, 'k--', 'LineWidth', 2);
+xlabel('Time (seconds)'); ylabel('Pitch Angle theta (radians)');
+title('ON-GROUND REFERENCE (clean, no fault)');
+legend('Sensor Measurement', 'Kalman Estimate', 'Fault Time (reference)', 'Location', 'best');
+grid on;
+
+% Subplot 3: Difference Signal (KEY INSIGHT!)
+subplot(3,2,3);
+plot(time, theta_difference_measured, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, theta_difference_estimated, 'r-', 'LineWidth', 2);
+plot([fault_start_time fault_start_time], ylim, 'k--', 'LineWidth', 2);
+xlabel('Time (seconds)'); ylabel('Difference (radians)');
+title('DIFFERENCE: In-Air minus On-Ground (Fault Isolated!)');
+legend('Measured Difference', 'Estimated Difference', 'Fault Start', 'Location', 'best');
+grid on;
+
+% Subplot 4: Innovation Comparison
+subplot(3,2,4);
+plot(time, innovation_inair, 'b-', 'LineWidth', 1); hold on;
+plot(time, innovation_ground, 'g-', 'LineWidth', 1);
+plot(time, innovation_difference, 'r-', 'LineWidth', 1.5);
+plot([fault_start_time fault_start_time], ylim, 'k--', 'LineWidth', 2);
+xlabel('Time (seconds)'); ylabel('Innovation (radians)');
+title('Kalman Filter Innovations');
+legend('In-Air', 'On-Ground', 'Difference', 'Fault Start', 'Location', 'best');
+grid on;
+
+% Subplot 5: Chi-Squared Statistic
+subplot(3,2,5);
+plot(time, chi2_statistic_log, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, chi2_detection_threshold * ones(size(time)), 'r--', 'LineWidth', 2);
+plot([fault_start_time fault_start_time], ylim, 'k--', 'LineWidth', 2);
+xlabel('Time (seconds)'); ylabel('Chi-Squared Statistic');
+title('Windowed Chi-Squared Test');
+legend('Statistic', 'Detection Threshold', 'Fault Start', 'Location', 'best');
+grid on;
+
+% Subplot 6: CUSUM Statistic
+subplot(3,2,6);
+plot(time, cusum_statistic_log, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, cusum_detection_threshold * ones(size(time)), 'r--', 'LineWidth', 2);
+plot([fault_start_time fault_start_time], ylim, 'k--', 'LineWidth', 2);
+xlabel('Time (seconds)'); ylabel('CUSUM Statistic');
+title('Adaptive CUSUM Test');
+legend('Statistic', 'Detection Threshold', 'Fault Start', 'Location', 'best');
+grid on;
+
+%% FIGURE 2: Detection Results
+figure('Position', [100 100 1600 700], 'Name', 'Fault Detection Results');
+
+% Chi-Squared Detection
+subplot(2,2,1);
+plot(time, fault_detected_chi2, 'b-', 'LineWidth', 2); hold on;
+plot(time, fault_actually_present, 'r--', 'LineWidth', 2);
+ylim([-0.1 1.2]);
+xlabel('Time (seconds)'); ylabel('Detection Flag (0=No, 1=Yes)');
+title(sprintf('Chi-Squared Detection (False Alarms=%d, Delay=%.0fms)', ...
+    false_positives_chi2, detection_delay_chi2_ms));
+legend('Detected Fault', 'Actual Fault Present', 'Location', 'best');
+grid on;
+
+% CUSUM Detection
+subplot(2,2,2);
+plot(time, fault_detected_cusum, 'b-', 'LineWidth', 2); hold on;
+plot(time, fault_actually_present, 'r--', 'LineWidth', 2);
+ylim([-0.1 1.2]);
+xlabel('Time (seconds)'); ylabel('Detection Flag (0=No, 1=Yes)');
+title(sprintf('CUSUM Detection (False Alarms=%d, Delay=%.0fms)', ...
+    false_positives_cusum, detection_delay_cusum_ms));
+legend('Detected Fault', 'Actual Fault Present', 'Location', 'best');
+grid on;
+
+% Combined Detection
+subplot(2,2,3);
+plot(time, fault_detected_combined, 'b-', 'LineWidth', 2); hold on;
+plot(time, fault_actually_present, 'r--', 'LineWidth', 2);
+ylim([-0.1 1.2]);
+xlabel('Time (seconds)'); ylabel('Detection Flag (0=No, 1=Yes)');
+title(sprintf('Combined Detection (False Alarms=%d, Delay=%.0fms)', ...
+    false_positives_combined, detection_delay_combined_ms));
+legend('Detected Fault', 'Actual Fault Present', 'Location', 'best');
+grid on;
+
+% Summary Text
+subplot(2,2,4);
+text(0.1, 0.85, 'FAULT DETECTION SUMMARY', 'FontSize', 14, 'FontWeight', 'bold');
+text(0.1, 0.70, sprintf('Fault Type: %s', fault_classification), 'FontSize', 12);
+text(0.1, 0.60, sprintf('Injected at: %.1f seconds', fault_start_time), 'FontSize', 12);
+text(0.1, 0.50, sprintf('Magnitude: %.2f rad (%.1f deg)', fault_magnitude, rad2deg(fault_magnitude)), 'FontSize', 12);
+text(0.1, 0.40, sprintf('Detection Delay: %.0f ms', detection_delay_combined_ms), 'FontSize', 12);
+text(0.1, 0.30, sprintf('False Alarms: %d', false_positives_combined), 'FontSize', 12);
+text(0.1, 0.20, sprintf('Duration Detected: %.2f sec', fault_duration_seconds), 'FontSize', 12);
+text(0.1, 0.10, 'Method: Two-Model Difference', 'FontSize', 12, 'FontWeight', 'bold');
+axis off;
+
+fprintf('================================================\n');
+fprintf('VISUALIZATION COMPLETE\n');
+fprintf('================================================\n\n');
+
+fprintf('KEY INSIGHT:\n');
+fprintf('  By subtracting On-Ground from In-Air models,\n');
+fprintf('  the fault is clearly isolated and detected!\n');
+fprintf('  Classification: %s\n', fault_classification);
+fprintf('================================================\n');
