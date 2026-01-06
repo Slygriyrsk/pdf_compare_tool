@@ -1,0 +1,622 @@
+%% ========================================================================
+%  ADAPTIVE KALMAN FILTER WITH INTELLIGENT QUANTIZATION
+%  Smart Event-Triggered Transmission for Fault Detection
+%  ========================================================================
+%
+%  NOVEL CONTRIBUTIONS:
+%  1. ADAPTIVE KALMAN: Q and R tuned online using innovation statistics
+%  2. SMART QUANTIZATION: Variable bit-depth based on fault probability
+%  3. EVENT-TRIGGERED TX: Send only significant changes
+%  4. GROUND RECONSTRUCTION: Receiver rebuilds signal from sparse data
+%  5. DELTA ENCODING: Transmit only differences
+%
+%  KEY INSIGHT: Difference signal is SPARSE during normal operation,
+%              DENSE during faults → Adaptive compression!
+%
+%% ========================================================================
+
+clear; clc; close all;
+
+fprintf('================================================================\n');
+fprintf('ADAPTIVE KALMAN + SMART QUANTIZATION SYSTEM\n');
+fprintf('Event-Triggered Sparse Transmission with Ground Reconstruction\n');
+fprintf('================================================================\n\n');
+
+%% ========================================================================
+%  SECTION 1: AIRCRAFT MODELS
+%% ========================================================================
+
+fprintf('Initializing aircraft models...\n');
+
+% State: [velocity_forward; velocity_vertical; pitch_rate]
+% Output: theta (pitch angle)
+% Input: elevator_deflection
+
+A_aircraft = [-0.313  56.7    0; 
+              -0.0139 -0.426  0; 
+               0      56.7    0];
+B_aircraft = [0.232; 0.0203; 0];
+C_aircraft = [0 0 1];
+
+sampling_time = 0.01;  % 100 Hz
+
+% Discretize
+A_discrete = expm(A_aircraft * sampling_time);
+if rcond(A_aircraft) > 1e-10
+    B_discrete = (A_aircraft \ (A_discrete - eye(3))) * B_aircraft;
+else
+    B_discrete = sampling_time * B_aircraft;
+end
+C_discrete = C_aircraft;
+
+fprintf('  Discrete-time model: READY\n\n');
+
+%% ========================================================================
+%  SECTION 2: SIMULATION PARAMETERS
+%% ========================================================================
+
+simulation_duration = 10;  % 10 seconds
+time = 0:sampling_time:simulation_duration;
+num_samples = length(time);
+
+elevator_deflection = 0.1 * ones(1, num_samples);
+
+% Initial noise covariances (will be adapted online!)
+process_noise_covariance_initial = eye(3) * 0.001;
+sensor_noise_variance_initial = 0.01;
+
+fprintf('Simulation: %d seconds, %d samples\n\n', simulation_duration, num_samples);
+
+%% ========================================================================
+%  SECTION 3: FAULT INJECTION
+%% ========================================================================
+
+% PERSISTENT FAULT at t=4s
+fault_start_time = 4.0;
+fault_start_sample = round(fault_start_time / sampling_time);
+fault_magnitude = 2.0;  % radians
+
+% GLITCH at t=7s (brief spike)
+glitch_time = 7.0;
+glitch_sample = round(glitch_time / sampling_time);
+glitch_duration = 5;  % 50ms
+glitch_magnitude = 3.5;
+
+fprintf('Fault Schedule:\n');
+fprintf('  Persistent fault: t=%.1fs, mag=%.1f rad\n', fault_start_time, fault_magnitude);
+fprintf('  Glitch: t=%.1fs, duration=%dms, mag=%.1f rad\n\n', ...
+    glitch_time, glitch_duration*10, glitch_magnitude);
+
+%% ========================================================================
+%  SECTION 4: ADAPTIVE KALMAN FILTER PARAMETERS
+%% ========================================================================
+
+fprintf('Configuring ADAPTIVE Kalman filters...\n');
+
+% INNOVATION-BASED ADAPTATION PARAMETERS
+innovation_window_length = 20;  % Window for computing statistics
+adaptation_rate = 0.05;         % How fast to adapt (0=no adapt, 1=instant)
+min_noise_variance = 0.0001;    % Don't adapt below this
+max_noise_variance = 0.1;       % Don't adapt above this
+
+% FORGETTING FACTOR (for exponentially weighted statistics)
+forgetting_factor = 0.95;
+
+fprintf('  Adaptation window: %d samples (%.0fms)\n', ...
+    innovation_window_length, innovation_window_length*sampling_time*1000);
+fprintf('  Adaptation rate: %.3f\n', adaptation_rate);
+fprintf('  Forgetting factor: %.2f\n\n', forgetting_factor);
+
+%% ========================================================================
+%  SECTION 5: QUANTIZATION PARAMETERS
+%% ========================================================================
+
+fprintf('Configuring SMART QUANTIZATION...\n');
+
+% ADAPTIVE QUANTIZATION LEVELS
+quantization_bits_normal = 6;      % Normal operation: 6 bits
+quantization_bits_suspicious = 12;  % Fault suspected: 12 bits
+quantization_bits_fault = 16;       % Fault confirmed: 16 bits
+
+% Quantization ranges (in radians)
+theta_min = -5.0;
+theta_max = 5.0;
+
+fprintf('  Normal mode: %d bits\n', quantization_bits_normal);
+fprintf('  Suspicious mode: %d bits\n', quantization_bits_suspicious);
+fprintf('  Fault mode: %d bits\n\n', quantization_bits_fault);
+
+%% ========================================================================
+%  SECTION 6: EVENT-TRIGGERED TRANSMISSION PARAMETERS
+%% ========================================================================
+
+fprintf('Configuring EVENT-TRIGGERED transmission...\n');
+
+% TRANSMISSION TRIGGERS
+threshold_significant_change = 0.03;  % Send if change > 0.03 rad
+threshold_innovation_sigma = 2.5;     % Send if innovation > 2.5-sigma
+periodic_update_interval = 50;        % Force send every 50 samples (0.5s)
+
+% DELTA ENCODING: Transmit differences instead of absolute values
+use_delta_encoding = true;
+
+fprintf('  Change threshold: %.3f rad\n', threshold_significant_change);
+fprintf('  Innovation threshold: %.1f-sigma\n', threshold_innovation_sigma);
+fprintf('  Periodic update: every %.1fs\n', periodic_update_interval*sampling_time);
+fprintf('  Delta encoding: %s\n\n', string(use_delta_encoding));
+
+%% ========================================================================
+%  SECTION 7: INITIALIZE STORAGE
+%% ========================================================================
+
+% IN-AIR AIRCRAFT (transmitter side)
+state_inair_true = [0; 0; 0];
+state_inair_estimate = [0; 0; 0];
+covariance_inair = eye(3);
+Q_inair_adaptive = process_noise_covariance_initial;  % Will be adapted!
+R_inair_adaptive = sensor_noise_variance_initial;      % Will be adapted!
+
+% ON-GROUND REFERENCE (transmitter side)
+state_ground_true = [0; 0; 0];
+state_ground_estimate = [0; 0; 0];
+covariance_ground = eye(3);
+Q_ground_adaptive = process_noise_covariance_initial;
+R_ground_adaptive = sensor_noise_variance_initial;
+
+% GROUND STATION RECEIVER (receives sparse data)
+state_receiver_estimate = [0; 0; 0];
+covariance_receiver = eye(3);
+Q_receiver_adaptive = process_noise_covariance_initial;
+R_receiver_adaptive = sensor_noise_variance_initial;
+
+% Storage arrays
+theta_inair_measured = zeros(1, num_samples);
+theta_inair_estimate = zeros(1, num_samples);
+theta_ground_estimate = zeros(1, num_samples);
+theta_difference_estimate = zeros(1, num_samples);
+
+innovation_inair = zeros(1, num_samples);
+innovation_ground = zeros(1, num_samples);
+innovation_difference = zeros(1, num_samples);
+
+% Adaptive parameters logging
+Q_trace_inair = zeros(1, num_samples);
+R_log_inair = zeros(1, num_samples);
+
+% Quantization
+theta_quantized = zeros(1, num_samples);
+quantization_error = zeros(1, num_samples);
+bits_used = zeros(1, num_samples);
+
+% Transmission
+transmitted_flag = zeros(1, num_samples);
+transmitted_samples = [];  % Indices of transmitted samples
+transmitted_values = [];   % Transmitted values
+
+% Receiver reconstruction
+theta_receiver_reconstructed = zeros(1, num_samples);
+reconstruction_error = zeros(1, num_samples);
+
+% Detection
+fault_detected_adaptive = zeros(1, num_samples);
+fault_probability = zeros(1, num_samples);
+
+% Innovation statistics (for adaptation)
+innovation_mean_estimate = 0;
+innovation_variance_estimate = 0.01;
+
+fprintf('Storage allocated for %d samples\n\n', num_samples);
+
+%% ========================================================================
+%  SECTION 8: HELPER FUNCTIONS FOR QUANTIZATION
+%% ========================================================================
+
+% Quantize function
+quantize = @(value, bits, vmin, vmax) round((value - vmin) / (vmax - vmin) * (2^bits - 1));
+
+% Dequantize function
+dequantize = @(quant_val, bits, vmin, vmax) vmin + quant_val * (vmax - vmin) / (2^bits - 1);
+
+%% ========================================================================
+%  SECTION 9: MAIN SIMULATION LOOP
+%% ========================================================================
+
+fprintf('================================================================\n');
+fprintf('STARTING SIMULATION WITH ADAPTIVE KALMAN\n');
+fprintf('================================================================\n\n');
+
+tic;
+
+last_transmitted_value = 0;  % For delta encoding
+last_transmitted_sample = 0;
+
+for sample_idx = 1:num_samples
+    
+    current_time = time(sample_idx);
+    
+    %% ===================================================================
+    %  IN-AIR AIRCRAFT (Transmitter Side)
+    %% ===================================================================
+    
+    % Generate noise
+    process_noise_chol = chol(Q_inair_adaptive, 'lower');
+    process_noise = process_noise_chol * randn(3, 1);
+    sensor_noise = sqrt(R_inair_adaptive) * randn;
+    
+    % True dynamics
+    state_inair_true = A_discrete * state_inair_true + ...
+                       B_discrete * elevator_deflection(sample_idx) + ...
+                       process_noise;
+    
+    % Measurement
+    theta_inair_measured(sample_idx) = C_discrete * state_inair_true + sensor_noise;
+    
+    % INJECT PERSISTENT FAULT
+    if sample_idx >= fault_start_sample
+        theta_inair_measured(sample_idx) = theta_inair_measured(sample_idx) + fault_magnitude;
+    end
+    
+    % INJECT GLITCH
+    if sample_idx >= glitch_sample && sample_idx < glitch_sample + glitch_duration
+        theta_inair_measured(sample_idx) = theta_inair_measured(sample_idx) + glitch_magnitude;
+    end
+    
+    % ADAPTIVE KALMAN FILTER - Prediction
+    state_inair_predicted = A_discrete * state_inair_estimate + ...
+                           B_discrete * elevator_deflection(sample_idx);
+    covariance_inair_predicted = A_discrete * covariance_inair * A_discrete' + Q_inair_adaptive;
+    
+    % ADAPTIVE KALMAN FILTER - Update
+    innovation_inair_current = theta_inair_measured(sample_idx) - ...
+                               C_discrete * state_inair_predicted;
+    innovation_covariance = C_discrete * covariance_inair_predicted * C_discrete' + R_inair_adaptive;
+    kalman_gain = covariance_inair_predicted * C_discrete' / innovation_covariance;
+    
+    state_inair_estimate = state_inair_predicted + kalman_gain * innovation_inair_current;
+    covariance_inair = (eye(3) - kalman_gain * C_discrete) * covariance_inair_predicted;
+    
+    theta_inair_estimate(sample_idx) = C_discrete * state_inair_estimate;
+    innovation_inair(sample_idx) = innovation_inair_current;
+    
+    %% ===================================================================
+    %  ADAPTIVE NOISE ESTIMATION (Innovation-Based)
+    %% ===================================================================
+    
+    % Update innovation statistics using exponential weighting
+    innovation_mean_estimate = forgetting_factor * innovation_mean_estimate + ...
+                              (1 - forgetting_factor) * innovation_inair_current;
+    innovation_variance_estimate = forgetting_factor * innovation_variance_estimate + ...
+                                  (1 - forgetting_factor) * (innovation_inair_current - innovation_mean_estimate)^2;
+    
+    % ADAPT R (measurement noise) based on innovation variance
+    if sample_idx > innovation_window_length
+        % Theoretical: E[innovation^2] = C*P*C' + R
+        % So: R_estimate = innovation_variance - C*P_predicted*C'
+        R_theoretical = C_discrete * covariance_inair_predicted * C_discrete';
+        R_estimated = max(min_noise_variance, innovation_variance_estimate - R_theoretical);
+        R_estimated = min(max_noise_variance, R_estimated);
+        
+        % Smooth adaptation
+        R_inair_adaptive = (1 - adaptation_rate) * R_inair_adaptive + ...
+                          adaptation_rate * R_estimated;
+    end
+    
+    % ADAPT Q (process noise) based on innovation consistency
+    if sample_idx > innovation_window_length
+        % If innovations are large, increase Q
+        innovation_normalized = abs(innovation_inair_current) / sqrt(innovation_covariance);
+        if innovation_normalized > 3.0  % Likely model mismatch or fault
+            Q_scale = 1.05;  % Increase Q by 5%
+        else
+            Q_scale = 0.99;  % Slowly decrease Q
+        end
+        Q_inair_adaptive = Q_inair_adaptive * Q_scale;
+        Q_inair_adaptive = max(min_noise_variance * eye(3), Q_inair_adaptive);
+        Q_inair_adaptive = min(max_noise_variance * eye(3), Q_inair_adaptive);
+    end
+    
+    % Log adaptive parameters
+    Q_trace_inair(sample_idx) = trace(Q_inair_adaptive);
+    R_log_inair(sample_idx) = R_inair_adaptive;
+    
+    %% ===================================================================
+    %  ON-GROUND REFERENCE (Transmitter Side)
+    %% ===================================================================
+    
+    % Generate independent noise
+    process_noise_ground_chol = chol(Q_ground_adaptive, 'lower');
+    process_noise_ground = process_noise_ground_chol * randn(3, 1);
+    sensor_noise_ground = sqrt(R_ground_adaptive) * randn;
+    
+    % True dynamics (NO FAULT)
+    state_ground_true = A_discrete * state_ground_true + ...
+                        B_discrete * elevator_deflection(sample_idx) + ...
+                        process_noise_ground;
+    
+    % Measurement (clean)
+    theta_ground_measured = C_discrete * state_ground_true + sensor_noise_ground;
+    
+    % Adaptive Kalman for ground (same adaptation logic)
+    state_ground_predicted = A_discrete * state_ground_estimate + ...
+                            B_discrete * elevator_deflection(sample_idx);
+    covariance_ground_predicted = A_discrete * covariance_ground * A_discrete' + Q_ground_adaptive;
+    
+    innovation_ground_current = theta_ground_measured - C_discrete * state_ground_predicted;
+    innovation_covariance_ground = C_discrete * covariance_ground_predicted * C_discrete' + R_ground_adaptive;
+    kalman_gain_ground = covariance_ground_predicted * C_discrete' / innovation_covariance_ground;
+    
+    state_ground_estimate = state_ground_predicted + kalman_gain_ground * innovation_ground_current;
+    covariance_ground = (eye(3) - kalman_gain_ground * C_discrete) * covariance_ground_predicted;
+    
+    theta_ground_estimate(sample_idx) = C_discrete * state_ground_estimate;
+    innovation_ground(sample_idx) = innovation_ground_current;
+    
+    %% ===================================================================
+    %  COMPUTE DIFFERENCE SIGNAL (Fault Isolation)
+    %% ===================================================================
+    
+    theta_difference_estimate(sample_idx) = theta_inair_estimate(sample_idx) - ...
+                                            theta_ground_estimate(sample_idx);
+    innovation_difference(sample_idx) = innovation_inair(sample_idx) - ...
+                                        innovation_ground(sample_idx);
+    
+    %% ===================================================================
+    %  FAULT PROBABILITY ESTIMATION (for adaptive quantization)
+    %% ===================================================================
+    
+    % Compute fault probability based on difference magnitude and innovation
+    difference_magnitude = abs(theta_difference_estimate(sample_idx));
+    innovation_magnitude_normalized = abs(innovation_difference(sample_idx)) / ...
+                                     sqrt(innovation_covariance + innovation_covariance_ground);
+    
+    % Simple probabilistic model
+    prob_from_difference = 1 - exp(-difference_magnitude / 0.5);
+    prob_from_innovation = 1 - exp(-max(0, innovation_magnitude_normalized - 2.0));
+    fault_probability(sample_idx) = max(prob_from_difference, prob_from_innovation);
+    
+    % Detect fault if probability high
+    if fault_probability(sample_idx) > 0.7
+        fault_detected_adaptive(sample_idx) = 1;
+    end
+    
+    %% ===================================================================
+    %  SMART ADAPTIVE QUANTIZATION
+    %% ===================================================================
+    
+    % Select quantization level based on fault probability
+    if fault_probability(sample_idx) > 0.7
+        % High fault probability → use high precision
+        current_quantization_bits = quantization_bits_fault;
+    elseif fault_probability(sample_idx) > 0.3
+        % Suspicious → medium precision
+        current_quantization_bits = quantization_bits_suspicious;
+    else
+        % Normal → low precision (save bandwidth)
+        current_quantization_bits = quantization_bits_normal;
+    end
+    
+    bits_used(sample_idx) = current_quantization_bits;
+    
+    % DELTA ENCODING: Quantize the DIFFERENCE from last transmitted value
+    if use_delta_encoding && last_transmitted_sample > 0
+        value_to_quantize = theta_difference_estimate(sample_idx) - ...
+                           theta_difference_estimate(last_transmitted_sample);
+        % Smaller range for delta → better resolution with same bits
+        delta_min = -1.0;
+        delta_max = 1.0;
+    else
+        value_to_quantize = theta_difference_estimate(sample_idx);
+        delta_min = theta_min;
+        delta_max = theta_max;
+    end
+    
+    % Quantize
+    quant_value = quantize(value_to_quantize, current_quantization_bits, delta_min, delta_max);
+    quant_value = max(0, min(2^current_quantization_bits - 1, quant_value));  % Clamp
+    
+    % Dequantize
+    theta_quantized(sample_idx) = dequantize(quant_value, current_quantization_bits, ...
+                                             delta_min, delta_max);
+    
+    % Reconstruct absolute value from delta
+    if use_delta_encoding && last_transmitted_sample > 0
+        theta_quantized(sample_idx) = theta_quantized(sample_idx) + ...
+                                      theta_difference_estimate(last_transmitted_sample);
+    end
+    
+    quantization_error(sample_idx) = theta_difference_estimate(sample_idx) - theta_quantized(sample_idx);
+    
+    %% ===================================================================
+    %  EVENT-TRIGGERED TRANSMISSION DECISION
+    %% ===================================================================
+    
+    should_transmit = false;
+    
+    % Trigger 1: Significant change
+    if last_transmitted_sample > 0
+        change_magnitude = abs(theta_difference_estimate(sample_idx) - ...
+                              theta_difference_estimate(last_transmitted_sample));
+        if change_magnitude > threshold_significant_change
+            should_transmit = true;
+        end
+    end
+    
+    % Trigger 2: Large innovation
+    if innovation_magnitude_normalized > threshold_innovation_sigma
+        should_transmit = true;
+    end
+    
+    % Trigger 3: Periodic safety update
+    if mod(sample_idx, periodic_update_interval) == 0
+        should_transmit = true;
+    end
+    
+    % Trigger 4: Fault detected
+    if fault_detected_adaptive(sample_idx) == 1
+        should_transmit = true;
+    end
+    
+    % Execute transmission
+    if should_transmit || sample_idx == 1  % Always transmit first sample
+        transmitted_flag(sample_idx) = 1;
+        transmitted_samples = [transmitted_samples, sample_idx];
+        transmitted_values = [transmitted_values, theta_quantized(sample_idx)];
+        last_transmitted_value = theta_quantized(sample_idx);
+        last_transmitted_sample = sample_idx;
+    end
+    
+    %% ===================================================================
+    %  GROUND STATION RECEIVER (Reconstructs from sparse data)
+    %% ===================================================================
+    
+    if transmitted_flag(sample_idx) == 1
+        % Received transmission - use measurement update
+        theta_received = theta_quantized(sample_idx);
+        
+        % Kalman update with received data
+        state_receiver_predicted = A_discrete * state_receiver_estimate + ...
+                                  B_discrete * elevator_deflection(sample_idx);
+        covariance_receiver_predicted = A_discrete * covariance_receiver * A_discrete' + Q_receiver_adaptive;
+        
+        innovation_receiver = theta_received - C_discrete * state_receiver_predicted;
+        innovation_cov_receiver = C_discrete * covariance_receiver_predicted * C_discrete' + R_receiver_adaptive;
+        kalman_gain_receiver = covariance_receiver_predicted * C_discrete' / innovation_cov_receiver;
+        
+        state_receiver_estimate = state_receiver_predicted + kalman_gain_receiver * innovation_receiver;
+        covariance_receiver = (eye(3) - kalman_gain_receiver * C_discrete) * covariance_receiver_predicted;
+        
+    else
+        % No transmission - use prediction only (model-based interpolation)
+        state_receiver_estimate = A_discrete * state_receiver_estimate + ...
+                                 B_discrete * elevator_deflection(sample_idx);
+        covariance_receiver = A_discrete * covariance_receiver * A_discrete' + Q_receiver_adaptive;
+    end
+    
+    theta_receiver_reconstructed(sample_idx) = C_discrete * state_receiver_estimate;
+    reconstruction_error(sample_idx) = theta_difference_estimate(sample_idx) - ...
+                                       theta_receiver_reconstructed(sample_idx);
+    
+    % Progress
+    if mod(sample_idx, 200) == 0
+        fprintf('  t = %.1fs (sample %d/%d)\n', current_time, sample_idx, num_samples);
+    end
+    
+end
+
+sim_time = toc;
+
+fprintf('\n================================================================\n');
+fprintf('SIMULATION COMPLETE: %.3f seconds (%.1fx real-time)\n', sim_time, simulation_duration/sim_time);
+fprintf('================================================================\n\n');
+
+%% ========================================================================
+%  SECTION 10: PERFORMANCE ANALYSIS
+%% ========================================================================
+
+fprintf('================================================================\n');
+fprintf('PERFORMANCE ANALYSIS\n');
+fprintf('================================================================\n\n');
+
+% Transmission statistics
+num_transmitted = sum(transmitted_flag);
+transmission_ratio = num_transmitted / num_samples * 100;
+total_bits_transmitted = sum(bits_used(transmitted_flag == 1));
+avg_bits_per_transmission = total_bits_transmitted / num_transmitted;
+
+% Compression analysis
+bits_if_always_32bit = num_samples * 32;
+bits_if_always_16bit = num_samples * 16;
+bits_actual = num_transmitted * avg_bits_per_transmission + (num_samples - num_transmitted) * 1;  % 1 bit flag
+
+compression_vs_32bit = (1 - bits_actual / bits_if_always_32bit) * 100;
+compression_vs_16bit = (1 - bits_actual / bits_if_always_16bit) * 100;
+
+% Reconstruction quality
+rmse_reconstruction = sqrt(mean(reconstruction_error.^2));
+max_reconstruction_error = max(abs(reconstruction_error));
+
+% Detection performance
+ground_truth = zeros(1, num_samples);
+ground_truth(fault_start_sample:end) = 1;
+ground_truth(glitch_sample:glitch_sample+glitch_duration-1) = 1;
+
+true_positives = sum(fault_detected_adaptive & ground_truth);
+false_positives = sum(fault_detected_adaptive & ~ground_truth);
+
+fprintf('TRANSMISSION STATISTICS:\n');
+fprintf('  Samples transmitted: %d / %d (%.1f%%)\n', num_transmitted, num_samples, transmission_ratio);
+fprintf('  Average bits per TX: %.1f bits\n', avg_bits_per_transmission);
+fprintf('  Total bits used: %.0f bits\n\n', bits_actual);
+
+fprintf('COMPRESSION PERFORMANCE:\n');
+fprintf('  vs 32-bit always: %.1f%% reduction\n', compression_vs_32bit);
+fprintf('  vs 16-bit always: %.1f%% reduction\n', compression_vs_16bit);
+fprintf('  Bandwidth: %.2f kbps @ 100Hz\n\n', bits_actual/simulation_duration/1000);
+
+fprintf('RECONSTRUCTION QUALITY:\n');
+fprintf('  RMSE: %.4f radians\n', rmse_reconstruction);
+fprintf('  Max error: %.4f radians\n\n', max_reconstruction_error);
+
+fprintf('DETECTION PERFORMANCE:\n');
+fprintf('  True detections: %d\n', true_positives);
+fprintf('  False alarms: %d\n', false_positives);
+fprintf('  Detection rate: %.1f%%\n\n', true_positives/sum(ground_truth)*100);
+
+fprintf('ADAPTIVE KALMAN STATISTICS:\n');
+fprintf('  Initial R: %.4f\n', sensor_noise_variance_initial);
+fprintf('  Final R: %.4f\n', R_inair_adaptive);
+fprintf('  R adaptation range: [%.4f, %.4f]\n', min(R_log_inair), max(R_log_inair));
+fprintf('  Q trace range: [%.4f, %.4f]\n\n', min(Q_trace_inair), max(Q_trace_inair));
+
+%% ========================================================================
+%  SECTION 11: VISUALIZATION
+%% ========================================================================
+
+fprintf('Generating visualizations...\n\n');
+
+figure('Position', [50 50 1800 1000], 'Name', 'Adaptive Kalman + Smart Quantization');
+
+% Signal comparison
+subplot(3,3,1);
+plot(time, theta_difference_estimate, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, theta_quantized, 'r.', 'MarkerSize', 8);
+scatter(time(transmitted_flag==1), theta_quantized(transmitted_flag==1), 50, 'g', 'filled');
+xlabel('Time (s)'); ylabel('Difference (rad)');
+title('Difference Signal: Original vs Quantized');
+legend('Original', 'Quantized', 'Transmitted', 'Location', 'best');
+grid on;
+
+% Reconstruction
+subplot(3,3,2);
+plot(time, theta_difference_estimate, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, theta_receiver_reconstructed, 'r--', 'LineWidth', 1.5);
+xlabel('Time (s)'); ylabel('Difference (rad)');
+title('Ground Station Reconstruction');
+legend('True Signal', 'Reconstructed', 'Location', 'best');
+grid on;
+
+% Reconstruction error
+subplot(3,3,3);
+plot(time, reconstruction_error, 'r-', 'LineWidth', 1);
+xlabel('Time (s)'); ylabel('Error (rad)');
+title(sprintf('Reconstruction Error (RMSE=%.4f)', rmse_reconstruction));
+grid on;
+
+% Adaptive R
+subplot(3,3,4);
+plot(time, R_log_inair, 'b-', 'LineWidth', 1.5);
+xlabel('Time (s)'); ylabel('R (measurement noise)');
+title('Adaptive Measurement Noise Variance');
+grid on;
+
+% Adaptive Q trace
+subplot(3,3,5);
+plot(time, Q_trace_inair, 'b-', 'LineWidth', 1.5);
+xlabel('Time (s)'); ylabel('trace(Q)');
+title('Adaptive Process Noise Covariance');
+grid on;
+
+% Fault probability
+subplot(3,3,6);
+plot(time, fault_probability, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, fault_detected_adaptive, 'r-', 'LineWidth
