@@ -1,0 +1,509 @@
+clear; clc; close all;
+
+fprintf('================================================================\n');
+fprintf('COMPLETE TWO-MODEL FAULT DETECTION WITH SIGNAL PACKING\n');
+fprintf('================================================================\n\n');
+
+%% ========================================================================
+%  PART 1: AIRCRAFT DYNAMICS MODEL
+%  State: [velocity_forward; velocity_vertical; pitch_rate]
+%  Output: theta (pitch angle)
+%% ========================================================================
+
+A_aircraft = [-0.313  56.7    0; 
+              -0.0139 -0.426  0; 
+               0      56.7    0];
+B_aircraft = [0.232; 0.0203; 0];
+C_aircraft = [0 0 1];
+
+sampling_time = 0.01;  % 100 Hz
+
+% Discrete-time conversion: x[k+1] = Ad*x[k] + Bd*u[k]
+Ad = expm(A_aircraft * sampling_time);
+if rcond(A_aircraft) > 1e-10
+    Bd = (A_aircraft \ (Ad - eye(3))) * B_aircraft;
+else
+    Bd = sampling_time * B_aircraft;
+end
+Cd = C_aircraft;
+
+fprintf('Aircraft Model: INITIALIZED\n');
+fprintf('Sampling Time: %.0f ms (%.0f Hz)\n\n', sampling_time*1000, 1/sampling_time);
+
+%% ========================================================================
+%  PART 2: SIMULATION PARAMETERS
+%% ========================================================================
+
+simulation_duration = 6;
+time = 0:sampling_time:simulation_duration;
+num_samples = length(time);
+
+elevator_deflection = 0.1 * ones(1, num_samples);
+
+% Kalman filter noise parameters
+Q_process = eye(3) * 0.001;  % Process noise covariance
+R_sensor = 0.01;             % Sensor noise variance
+L_Q = chol(Q_process, 'lower');
+
+% FAULT INJECTION: 3.0s to 4.0s (persistent bias)
+fault_start_time = 3.0;
+fault_end_time = 4.0;
+fault_start_sample = round(fault_start_time / sampling_time);
+fault_end_sample = round(fault_end_time / sampling_time);
+fault_magnitude = 0.4;  % radians
+
+fprintf('Simulation Duration: %.0f seconds (%d samples)\n', simulation_duration, num_samples);
+fprintf('Fault Injection: t=[%.1f, %.1f]s, magnitude=%.2f rad\n\n', ...
+    fault_start_time, fault_end_time, fault_magnitude);
+
+%% ========================================================================
+%  PART 3: SIGNAL PACKING SETUP
+%  Total: 32 bits = 8+7+7+6 (signals) + 4 (CRC)
+%  Formula: packed = s1 + s2*2^8 + s3*2^15 + s4*2^22 + crc*2^28
+%% ========================================================================
+
+signal_ranges = struct();
+signal_ranges.theta = [-0.5, 0.5];
+signal_ranges.pitch_rate = [-1.0, 1.0];
+signal_ranges.elevator = [-0.3, 0.3];
+signal_ranges.velocity = [-5.0, 5.0];
+
+% Quantization: value → integer (0 to 2^bits-1)
+quantize = @(val, bits, range) max(0, min(2^bits-1, ...
+    round((val - range(1)) / (range(2) - range(1)) * (2^bits - 1))));
+
+% Dequantization: integer → value
+dequantize = @(quant, bits, range) range(1) + quant * (range(2) - range(1)) / (2^bits - 1);
+
+% CRC-4 checksum: sum mod 16
+calc_crc = @(s1, s2, s3, s4) mod(s1 + s2 + s3 + s4, 16);
+
+fprintf('Signal Packing Configuration:\n');
+fprintf('  Theta:      8 bits (256 levels), resolution = %.4f rad\n', 1.0/256);
+fprintf('  Pitch Rate: 7 bits (128 levels)\n');
+fprintf('  Elevator:   7 bits (128 levels)\n');
+fprintf('  Velocity:   6 bits (64 levels)\n');
+fprintf('  CRC:        4 bits\n\n');
+
+%% ========================================================================
+%  PART 4: DETECTION ALGORITHMS SETUP
+%% ========================================================================
+
+% Windowed Chi-Squared Test
+window_length = 15;
+chi2_threshold = 21.666;  % 99% confidence, df=15
+residual_window = zeros(1, window_length);
+
+% Adaptive CUSUM
+cusum_threshold = 4.0;
+cusum_drift = 0.5;
+cusum_positive = 0;
+cusum_negative = 0;
+
+fprintf('Detection Algorithms:\n');
+fprintf('  Chi-Squared: window=%d, threshold=%.2f\n', window_length, chi2_threshold);
+fprintf('  CUSUM: threshold=%.1f, drift=%.1f\n\n', cusum_threshold, cusum_drift);
+
+%% ========================================================================
+%  PART 5: INITIALIZE STATE VARIABLES
+%% ========================================================================
+
+% IN-AIR MODEL (has fault)
+state_inair_true = [0; 0; 0];
+state_inair_estimate = [0; 0; 0];
+covariance_inair = eye(3);
+
+% ON-GROUND MODEL (reference, no fault)
+state_ground_true = [0; 0; 0];
+state_ground_estimate = [0; 0; 0];
+covariance_ground = eye(3);
+
+% STORAGE ARRAYS
+theta_inair_measured = zeros(1, num_samples);
+theta_inair_estimate = zeros(1, num_samples);
+theta_ground_measured = zeros(1, num_samples);
+theta_ground_estimate = zeros(1, num_samples);
+theta_difference = zeros(1, num_samples);
+
+kalman_gain_inair = zeros(1, num_samples);
+kalman_gain_ground = zeros(1, num_samples);
+
+innovation_inair = zeros(1, num_samples);
+innovation_ground = zeros(1, num_samples);
+innovation_difference = zeros(1, num_samples);
+
+% Detection results
+chi2_statistic = zeros(1, num_samples);
+cusum_statistic = zeros(1, num_samples);
+fault_chi2 = zeros(1, num_samples);
+fault_cusum = zeros(1, num_samples);
+fault_combined = zeros(1, num_samples);
+
+% Packing results
+theta_before_pack = zeros(1, num_samples);
+theta_after_unpack = zeros(1, num_samples);
+packed_integers = zeros(1, num_samples);
+crc_valid = zeros(1, num_samples);
+
+% Status flags (4 bits)
+status_flag_kalman_spike = zeros(1, num_samples);
+status_flag_high_innovation = zeros(1, num_samples);
+status_flag_chi2_alarm = zeros(1, num_samples);
+status_flag_cusum_alarm = zeros(1, num_samples);
+
+% Transmission error injection
+error_injection_sample = round(5.0 / sampling_time);  % Inject error at t=5s
+
+fprintf('Initialization: COMPLETE\n');
+fprintf('Starting simulation...\n\n');
+
+%% ========================================================================
+%  PART 6: MAIN SIMULATION LOOP
+%% ========================================================================
+
+kalman_gain_baseline = 0;
+
+tic;
+for k = 1:num_samples
+    
+    %% ==================================================================
+    %  IN-AIR AIRCRAFT (Transmitter with fault)
+    %% ==================================================================
+    
+    % True system dynamics: x[k+1] = Ad*x[k] + Bd*u[k] + w[k]
+    process_noise = L_Q * randn(3, 1);
+    state_inair_true = Ad * state_inair_true + Bd * elevator_deflection(k) + process_noise;
+    
+    % Sensor measurement: y[k] = Cd*x[k] + v[k]
+    sensor_noise = sqrt(R_sensor) * randn;
+    theta_inair_measured(k) = Cd * state_inair_true + sensor_noise;
+    
+    % INJECT FAULT between t=3s and t=4s
+    if k >= fault_start_sample && k <= fault_end_sample
+        theta_inair_measured(k) = theta_inair_measured(k) + fault_magnitude;
+    end
+    
+    % KALMAN FILTER - Prediction
+    % x_pred = Ad*x_est + Bd*u
+    state_predicted = Ad * state_inair_estimate + Bd * elevator_deflection(k);
+    % P_pred = Ad*P*Ad' + Q
+    covariance_predicted = Ad * covariance_inair * Ad' + Q_process;
+    
+    % KALMAN FILTER - Update
+    % innovation = y - Cd*x_pred
+    innov = theta_inair_measured(k) - Cd * state_predicted;
+    % S = Cd*P_pred*Cd' + R
+    innovation_covariance = Cd * covariance_predicted * Cd' + R_sensor;
+    % K = P_pred*Cd' / S
+    K = covariance_predicted * Cd' / innovation_covariance;
+    
+    % x_est = x_pred + K*innovation
+    state_inair_estimate = state_predicted + K * innov;
+    % P = (I - K*Cd)*P_pred
+    covariance_inair = (eye(3) - K * Cd) * covariance_predicted;
+    
+    theta_inair_estimate(k) = Cd * state_inair_estimate;
+    innovation_inair(k) = innov;
+    kalman_gain_inair(k) = norm(K);
+    
+    % Establish baseline Kalman gain (first 100 samples)
+    if k <= 100
+        kalman_gain_baseline = mean([kalman_gain_baseline, kalman_gain_inair(k)]);
+    end
+    
+    %% ==================================================================
+    %  ON-GROUND REFERENCE MODEL (Clean baseline)
+    %% ==================================================================
+    
+    process_noise_ground = L_Q * randn(3, 1);
+    state_ground_true = Ad * state_ground_true + Bd * elevator_deflection(k) + process_noise_ground;
+    
+    sensor_noise_ground = sqrt(R_sensor) * randn;
+    theta_ground_measured(k) = Cd * state_ground_true + sensor_noise_ground;
+    % NO FAULT injected in ground model
+    
+    % Kalman filter for ground
+    state_predicted_ground = Ad * state_ground_estimate + Bd * elevator_deflection(k);
+    covariance_predicted_ground = Ad * covariance_ground * Ad' + Q_process;
+    
+    innov_ground = theta_ground_measured(k) - Cd * state_predicted_ground;
+    innovation_cov_ground = Cd * covariance_predicted_ground * Cd' + R_sensor;
+    K_ground = covariance_predicted_ground * Cd' / innovation_cov_ground;
+    
+    state_ground_estimate = state_predicted_ground + K_ground * innov_ground;
+    covariance_ground = (eye(3) - K_ground * Cd) * covariance_predicted_ground;
+    
+    theta_ground_estimate(k) = Cd * state_ground_estimate;
+    innovation_ground(k) = innov_ground;
+    kalman_gain_ground(k) = norm(K_ground);
+    
+    %% ==================================================================
+    %  DIFFERENCE SIGNAL (Fault Isolation)
+    %  Key insight: In-Air - Ground = Fault signal only!
+    %% ==================================================================
+    
+    theta_difference(k) = theta_inair_estimate(k) - theta_ground_estimate(k);
+    innovation_difference(k) = innovation_inair(k) - innovation_ground(k);
+    
+    %% ==================================================================
+    %  DETECTION ALGORITHM 1: Windowed Chi-Squared Test
+    %  H0: No fault, residuals ~ chi2(window_length)
+    %  Statistic: sum of (innovation^2 / variance) over window
+    %% ==================================================================
+    
+    normalized_residual = (innovation_difference(k))^2 / (innovation_covariance + innovation_cov_ground);
+    residual_window = [residual_window(2:end), normalized_residual];
+    
+    if k >= window_length
+        chi2_stat = sum(residual_window);
+        chi2_statistic(k) = chi2_stat;
+        
+        if chi2_stat > chi2_threshold
+            fault_chi2(k) = 1;
+        end
+    end
+    
+    %% ==================================================================
+    %  DETECTION ALGORITHM 2: Adaptive CUSUM
+    %  Accumulates deviations: S+ = max(0, S+ + z - k)
+    %% ==================================================================
+    
+    normalized_innovation = innovation_difference(k) / sqrt(innovation_covariance + innovation_cov_ground);
+    
+    cusum_positive = max(0, cusum_positive + normalized_innovation - cusum_drift);
+    cusum_negative = max(0, cusum_negative - normalized_innovation - cusum_drift);
+    
+    cusum_stat = max(cusum_positive, cusum_negative);
+    cusum_statistic(k) = cusum_stat;
+    
+    if cusum_stat > cusum_threshold
+        fault_cusum(k) = 1;
+        cusum_positive = 0;  % Reset after detection
+        cusum_negative = 0;
+    end
+    
+    %% ==================================================================
+    %  COMBINED DETECTION: Both methods must agree
+    %% ==================================================================
+    
+    if fault_chi2(k) == 1 && fault_cusum(k) == 1
+        fault_combined(k) = 1;
+    end
+    
+    %% ==================================================================
+    %  SIGNAL PACKING (32-bit integer)
+    %  Bits: [s1(8) | s2(7) | s3(7) | s4(6) | crc(4)]
+    %  Formula: I = s1 + s2*2^8 + s3*2^15 + s4*2^22 + crc*2^28
+    %% ==================================================================
+    
+    theta_before_pack(k) = theta_difference(k);
+    
+    % Quantize signals to integers
+    s1 = quantize(theta_difference(k), 8, signal_ranges.theta);
+    s2 = quantize(state_inair_estimate(3), 7, signal_ranges.pitch_rate);
+    s3 = quantize(elevator_deflection(k), 7, signal_ranges.elevator);
+    s4 = quantize(state_inair_estimate(1), 6, signal_ranges.velocity);
+    
+    % Calculate CRC checksum
+    crc = calc_crc(s1, s2, s3, s4);
+    
+    % Pack into 32-bit integer using bit-shifting
+    packed = uint32(s1) + bitshift(uint32(s2), 8) + bitshift(uint32(s3), 15) + ...
+             bitshift(uint32(s4), 22) + bitshift(uint32(crc), 28);
+    
+    packed_integers(k) = double(packed);
+    
+    % STATUS FLAGS (4 bits) - embedded in bits 24-27
+    flag_kgain = (kalman_gain_inair(k) / max(kalman_gain_baseline, 0.01)) > 3.0;
+    flag_innov = abs(normalized_innovation) > 2.5;
+    flag_chi2 = fault_chi2(k);
+    flag_cusum = fault_cusum(k);
+    
+    status_flag_kalman_spike(k) = flag_kgain;
+    status_flag_high_innovation(k) = flag_innov;
+    status_flag_chi2_alarm(k) = flag_chi2;
+    status_flag_cusum_alarm(k) = flag_cusum;
+    
+    % SIMULATE TRANSMISSION ERROR at t=5s
+    if k == error_injection_sample
+        fprintf('>>> INJECTING BIT ERROR at t=%.1fs (sample %d)\n', time(k), k);
+        packed = bitxor(packed, uint32(1));  % Flip least significant bit
+    end
+    
+    % UNPACK at receiver
+    s1_rx = double(bitand(packed, uint32(255)));
+    s2_rx = double(bitand(bitshift(packed, -8), uint32(127)));
+    s3_rx = double(bitand(bitshift(packed, -15), uint32(127)));
+    s4_rx = double(bitand(bitshift(packed, -22), uint32(63)));
+    crc_rx = double(bitand(bitshift(packed, -28), uint32(15)));
+    
+    % Verify CRC
+    crc_computed = calc_crc(s1_rx, s2_rx, s3_rx, s4_rx);
+    crc_valid(k) = (crc_rx == crc_computed);
+    
+    % Dequantize
+    theta_after_unpack(k) = dequantize(s1_rx, 8, signal_ranges.theta);
+    
+    % Print every 100 samples
+    if mod(k, 100) == 0
+        fprintf('t=%.2fs: packed=%u, CRC=%s, K_gain=%.4f\n', ...
+            time(k), packed, string(crc_valid(k)), kalman_gain_inair(k));
+    end
+    
+end
+
+sim_time = toc;
+fprintf('\nSimulation Complete: %.3f seconds\n\n', sim_time);
+
+%% ========================================================================
+%  PART 7: RESULTS AND STATISTICS
+%% ========================================================================
+
+fprintf('================================================================\n');
+fprintf('RESULTS SUMMARY\n');
+fprintf('================================================================\n\n');
+
+% Detection performance
+ground_truth = zeros(1, num_samples);
+ground_truth(fault_start_sample:fault_end_sample) = 1;
+
+tp_chi2 = sum(fault_chi2 & ground_truth);
+fp_chi2 = sum(fault_chi2 & ~ground_truth);
+tp_cusum = sum(fault_cusum & ground_truth);
+fp_cusum = sum(fault_cusum & ~ground_truth);
+tp_combined = sum(fault_combined & ground_truth);
+fp_combined = sum(fault_combined & ~ground_truth);
+
+% Packing accuracy
+packing_error = theta_before_pack - theta_after_unpack;
+rmse_packing = sqrt(mean(packing_error.^2));
+max_packing_error = max(abs(packing_error));
+
+num_crc_failures = sum(~crc_valid);
+
+fprintf('FAULT DETECTION PERFORMANCE:\n');
+fprintf('  Chi-Squared: TP=%d, FP=%d\n', tp_chi2, fp_chi2);
+fprintf('  CUSUM:       TP=%d, FP=%d\n', tp_cusum, fp_cusum);
+fprintf('  Combined:    TP=%d, FP=%d\n\n', tp_combined, fp_combined);
+
+fprintf('SIGNAL PACKING PERFORMANCE:\n');
+fprintf('  RMSE: %.6f radians (%.4f degrees)\n', rmse_packing, rad2deg(rmse_packing));
+fprintf('  Max Error: %.6f radians\n', max_packing_error);
+fprintf('  CRC Failures: %d / %d samples\n\n', num_crc_failures, num_samples);
+
+fprintf('KALMAN GAIN ANALYSIS:\n');
+fprintf('  Baseline K (normal): %.4f\n', kalman_gain_baseline);
+fprintf('  Max K (during fault): %.4f\n', max(kalman_gain_inair));
+fprintf('  K spike ratio: %.2fx\n\n', max(kalman_gain_inair)/kalman_gain_baseline);
+
+fprintf('PACKED INTEGER EXAMPLES:\n');
+fprintf('  Sample 100 (normal):  %u\n', uint32(packed_integers(100)));
+fprintf('  Sample 350 (fault):   %u\n', uint32(packed_integers(350)));
+fprintf('  Sample 500 (error):   %u\n\n', uint32(packed_integers(error_injection_sample)));
+
+%% ========================================================================
+%  PART 8: VISUALIZATION
+%% ========================================================================
+
+fprintf('Generating plots...\n\n');
+
+figure('Position', [50 50 1800 1000], 'Name', 'Complete System Overview');
+
+% Plot 1: In-Air Model
+subplot(3,3,1);
+plot(time, theta_inair_measured, 'b-', 'LineWidth', 1); hold on;
+plot(time, theta_inair_estimate, 'r--', 'LineWidth', 1.5);
+plot([fault_start_time fault_start_time], ylim, 'k--', 'LineWidth', 2);
+plot([fault_end_time fault_end_time], ylim, 'k--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Theta (rad)');
+title('IN-AIR MODEL (with fault)');
+legend('Measured', 'Kalman Est', 'Fault Start/End', 'Location', 'best');
+grid on;
+
+% Plot 2: On-Ground Model
+subplot(3,3,2);
+plot(time, theta_ground_measured, 'b-', 'LineWidth', 1); hold on;
+plot(time, theta_ground_estimate, 'r--', 'LineWidth', 1.5);
+plot([fault_start_time fault_start_time], ylim, 'k--', 'LineWidth', 2);
+plot([fault_end_time fault_end_time], ylim, 'k--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Theta (rad)');
+title('ON-GROUND MODEL (reference)');
+legend('Measured', 'Kalman Est', 'Location', 'best');
+grid on;
+
+% Plot 3: Difference Signal
+subplot(3,3,3);
+plot(time, theta_difference, 'b-', 'LineWidth', 1.5);
+plot([fault_start_time fault_start_time], ylim, 'r--', 'LineWidth', 2);
+plot([fault_end_time fault_end_time], ylim, 'r--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Difference (rad)');
+title('DIFFERENCE: In-Air - Ground');
+grid on;
+
+% Plot 4: Kalman Gain (IN-AIR) - KEY PLOT!
+subplot(3,3,4);
+plot(time, kalman_gain_inair, 'b-', 'LineWidth', 2); hold on;
+plot(time, kalman_gain_baseline*ones(size(time)), 'g--', 'LineWidth', 1.5);
+plot([fault_start_time fault_start_time], ylim, 'r--', 'LineWidth', 2);
+plot([fault_end_time fault_end_time], ylim, 'r--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('||K||');
+title('KALMAN GAIN - In-Air (Watch the spike!)');
+legend('K(t)', 'Baseline', 'Fault Period', 'Location', 'best');
+grid on;
+
+% Plot 5: Chi-Squared Statistic
+subplot(3,3,5);
+plot(time, chi2_statistic, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, chi2_threshold*ones(size(time)), 'r--', 'LineWidth', 2);
+plot([fault_start_time fault_start_time], ylim, 'k--', 'LineWidth', 2);
+plot([fault_end_time fault_end_time], ylim, 'k--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Statistic');
+title('WINDOWED CHI-SQUARED TEST');
+legend('Statistic', 'Threshold', 'Location', 'best');
+grid on;
+
+% Plot 6: CUSUM Statistic
+subplot(3,3,6);
+plot(time, cusum_statistic, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, cusum_threshold*ones(size(time)), 'r--', 'LineWidth', 2);
+plot([fault_start_time fault_start_time], ylim, 'k--', 'LineWidth', 2);
+plot([fault_end_time fault_end_time], ylim, 'k--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Statistic');
+title('ADAPTIVE CUSUM');
+legend('Statistic', 'Threshold', 'Location', 'best');
+grid on;
+
+% Plot 7: Packing Comparison
+subplot(3,3,7);
+plot(time, theta_before_pack, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, theta_after_unpack, 'r.', 'MarkerSize', 6);
+xlabel('Time (s)'); ylabel('Theta Difference (rad)');
+title(sprintf('BEFORE vs AFTER PACKING (RMSE=%.4f)', rmse_packing));
+legend('Before Pack', 'After Unpack', 'Location', 'best');
+grid on;
+
+% Plot 8: CRC Validation
+subplot(3,3,8);
+plot(time, crc_valid, 'g-', 'LineWidth', 2); hold on;
+plot([time(error_injection_sample) time(error_injection_sample)], [0 1], 'r--', 'LineWidth', 3);
+ylim([-0.1 1.2]);
+xlabel('Time (s)'); ylabel('Valid (1/0)');
+title(sprintf('CRC VALIDATION (%d failures)', num_crc_failures));
+legend('CRC OK', 'Injected Error', 'Location', 'best');
+grid on;
+
+% Plot 9: Status Flags
+subplot(3,3,9);
+plot(time, status_flag_kalman_spike*4, 'r-', 'LineWidth', 1.5); hold on;
+plot(time, status_flag_high_innovation*3, 'b-', 'LineWidth', 1.5);
+plot(time, status_flag_chi2_alarm*2, 'g-', 'LineWidth', 1.5);
+plot(time, status_flag_cusum_alarm*1, 'm-', 'LineWidth', 1.5);
+ylim([0 5]);
+xlabel('Time (s)'); ylabel('Flag Level');
+title('STATUS FLAGS (4-bit boolean indicators)');
+legend('K-Gain Spike', 'High Innovation', 'Chi2 Alarm', 'CUSUM Alarm', 'Location', 'best');
+grid on;
+
+fprintf('================================================================\n');
+fprintf('ALL PLOTS GENERATED\n');
+fprintf('================================================================\n');
