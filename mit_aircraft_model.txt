@@ -1,0 +1,428 @@
+clear; clc; close all;
+
+fprintf('================================================================\n');
+fprintf('MIT OCW 16.333 AIRCRAFT LONGITUDINAL DYNAMICS MODEL\n');
+fprintf('Full State-Space with Thrust, Altitude, and Position\n');
+fprintf('================================================================\n\n');
+
+%% ========================================================================
+%  AIRCRAFT PARAMETERS (Typical General Aviation Aircraft)
+%  Reference: MIT OCW 16.333, Lecture Notes on Longitudinal Dynamics
+%% ========================================================================
+
+% Mass and geometry
+m = 1200;           % Mass (kg)
+Iyy = 3000;         % Pitch moment of inertia (kg·m²)
+S = 17;             % Wing area (m²)
+c_bar = 1.5;        % Mean aerodynamic chord (m)
+b = 10;             % Wing span (m)
+
+% Trim conditions (steady level flight)
+U0 = 50;            % Trim forward velocity (m/s)
+W0 = 0;             % Trim vertical velocity (m/s)
+theta0 = 0;         % Trim pitch angle (rad)
+h0 = 1000;          % Initial altitude (m)
+g = 9.81;           % Gravity (m/s²)
+
+% Atmospheric properties (ISA standard atmosphere)
+rho0 = 1.225;       % Sea level air density (kg/m³)
+rho_h = @(h) rho0 * exp(-h/10400);  % Density variation with altitude
+
+% Aerodynamic derivatives (dimensionless)
+CL0 = 0.4;          % Lift coefficient at zero AoA
+CLalpha = 5.0;      % Lift curve slope (1/rad)
+CLq = 4.0;          % Lift due to pitch rate
+CLdelta_e = 0.4;    % Lift due to elevator
+
+CD0 = 0.03;         % Parasite drag coefficient
+K = 0.05;           % Induced drag factor
+
+CM0 = 0.0;          % Pitching moment at zero AoA
+CMalpha = -0.8;     % Pitch stiffness (static stability)
+CMq = -15.0;        % Pitch damping
+CMdelta_e = -1.2;   % Pitch control effectiveness
+
+% Thrust model
+T_max = 3000;       % Maximum thrust (N)
+T_trim = m * g * CD0 / CL0;  % Trim thrust (drag = weight component)
+
+% Control limits
+delta_e_max = 25 * pi/180;   % Elevator limit (rad)
+delta_t_max = 1.0;           % Throttle limit (0 to 1)
+
+fprintf('Aircraft Parameters:\n');
+fprintf('  Mass: %.0f kg\n', m);
+fprintf('  Wing area: %.1f m²\n', S);
+fprintf('  Trim speed: %.0f m/s\n', U0);
+fprintf('  Initial altitude: %.0f m\n\n', h0);
+
+%% ========================================================================
+%  STATE-SPACE MODEL
+%  States: x = [u; w; q; theta; h; px; pz]
+%    u     = forward velocity perturbation (m/s)
+%    w     = vertical velocity perturbation (m/s)
+%    q     = pitch rate (rad/s)
+%    theta = pitch angle (rad)
+%    h     = altitude (m)
+%    px    = horizontal position (m)
+%    pz    = vertical position (m)
+%
+%  Inputs: u_control = [delta_e; delta_t]
+%    delta_e = elevator deflection (rad)
+%    delta_t = throttle setting (0 to 1)
+%
+%  Equations of Motion (MIT OCW format):
+%    ů = -g*sin(theta) + (T - D)/m - q*w
+%    ẇ = g*cos(theta) + L/m - q*u
+%    q̇ = M/Iyy
+%    θ̇ = q
+%    ḣ = u*sin(theta) + w*cos(theta)
+%    ṗx = u*cos(theta) - w*sin(theta)
+%    ṗz = -ḣ
+%% ========================================================================
+
+% Nonlinear dynamics function
+function xdot = aircraft_dynamics(t, x, u_control, params)
+    
+    % Extract states
+    u = x(1);           % Forward velocity perturbation
+    w = x(2);           % Vertical velocity
+    q = x(3);           % Pitch rate
+    theta = x(4);       % Pitch angle
+    h = x(5);           % Altitude
+    px = x(6);          % Horizontal position
+    pz = x(7);          % Vertical position
+    
+    % Extract controls
+    delta_e = u_control(1);  % Elevator
+    delta_t = u_control(2);  % Throttle
+    
+    % Total velocities
+    U_total = params.U0 + u;
+    W_total = w;
+    V_total = sqrt(U_total^2 + W_total^2);
+    
+    % Angle of attack: α = atan(w/u)
+    alpha = atan2(W_total, U_total);
+    
+    % Dynamic pressure: q_bar = 0.5*rho*V²
+    rho = params.rho0 * exp(-h/10400);
+    q_bar = 0.5 * rho * V_total^2;
+    
+    % Aerodynamic forces
+    % Lift: L = q_bar*S*[CL0 + CLalpha*alpha + CLq*(q*c_bar)/(2*V) + CLdelta_e*delta_e]
+    CL = params.CL0 + params.CLalpha*alpha + ...
+         params.CLq*(q*params.c_bar)/(2*V_total) + ...
+         params.CLdelta_e*delta_e;
+    L = q_bar * params.S * CL;
+    
+    % Drag: D = q_bar*S*[CD0 + K*CL²]
+    CD = params.CD0 + params.K * CL^2;
+    D = q_bar * params.S * CD;
+    
+    % Pitching moment: M = q_bar*S*c_bar*[CM0 + CMalpha*alpha + CMq*(q*c_bar)/(2*V) + CMdelta_e*delta_e]
+    CM = params.CM0 + params.CMalpha*alpha + ...
+         params.CMq*(q*params.c_bar)/(2*V_total) + ...
+         params.CMdelta_e*delta_e;
+    M = q_bar * params.S * params.c_bar * CM;
+    
+    % Thrust (first-order lag to simulate engine dynamics)
+    T = params.T_max * delta_t;
+    
+    % Equations of motion (body axis)
+    u_dot = -params.g*sin(theta) + (T*cos(alpha) - D)/params.m - q*w;
+    w_dot = params.g*cos(theta) + (T*sin(alpha) + L)/params.m + q*u;
+    q_dot = M / params.Iyy;
+    theta_dot = q;
+    
+    % Position rates (inertial frame)
+    h_dot = U_total*sin(theta) + W_total*cos(theta);
+    px_dot = U_total*cos(theta) - W_total*sin(theta);
+    pz_dot = -h_dot;
+    
+    % State derivative
+    xdot = [u_dot; w_dot; q_dot; theta_dot; h_dot; px_dot; pz_dot];
+end
+
+%% ========================================================================
+%  SIMULATION SETUP
+%% ========================================================================
+
+% Time parameters
+t_end = 60;         % Simulation duration (seconds)
+dt = 0.01;          % Time step (100 Hz)
+time = 0:dt:t_end;
+N = length(time);
+
+% Initial conditions: [u, w, q, theta, h, px, pz]
+x0 = [0;            % Start at trim (u = 0)
+      0;            % w = 0
+      0;            % q = 0
+      0;            % theta = 0
+      h0;           % Initial altitude
+      0;            % px = 0
+      -h0];         % pz = -h0
+
+% Package parameters
+params = struct();
+params.m = m;
+params.Iyy = Iyy;
+params.S = S;
+params.c_bar = c_bar;
+params.U0 = U0;
+params.g = g;
+params.rho0 = rho0;
+params.CL0 = CL0;
+params.CLalpha = CLalpha;
+params.CLq = CLq;
+params.CLdelta_e = CLdelta_e;
+params.CD0 = CD0;
+params.K = K;
+params.CM0 = CM0;
+params.CMalpha = CMalpha;
+params.CMq = CMq;
+params.CMdelta_e = CMdelta_e;
+params.T_max = T_max;
+
+fprintf('Simulation Setup:\n');
+fprintf('  Duration: %.0f seconds\n', t_end);
+fprintf('  Time step: %.0f ms\n', dt*1000);
+fprintf('  Initial altitude: %.0f m\n\n', h0);
+
+%% ========================================================================
+%  CONTROL INPUT SEQUENCE (Test different maneuvers)
+%% ========================================================================
+
+% Preallocate control inputs
+delta_e = zeros(1, N);   % Elevator deflection (rad)
+delta_t = zeros(1, N);   % Throttle (0-1)
+
+% MANEUVER 1: Elevator doublet (t=5-7s)
+t1_start = round(5/dt);
+t1_end = round(6/dt);
+t2_start = round(6/dt);
+t2_end = round(7/dt);
+delta_e(t1_start:t1_end) = 5*pi/180;   % +5 degrees
+delta_e(t2_start:t2_end) = -5*pi/180;  % -5 degrees
+
+% MANEUVER 2: Throttle increase (t=20-30s) - climb
+t3_start = round(20/dt);
+t3_end = round(30/dt);
+delta_t(1:t3_start) = T_trim/T_max;    % Trim throttle
+delta_t(t3_start:t3_end) = 0.8;        % 80% throttle (climb)
+delta_t(t3_end:end) = T_trim/T_max;    % Back to trim
+
+% MANEUVER 3: Descent (t=40-50s)
+t4_start = round(40/dt);
+t4_end = round(50/dt);
+delta_e(t4_start:t4_end) = -3*pi/180;  % Nose down
+
+fprintf('Control Inputs Configured:\n');
+fprintf('  Elevator doublet: t=5-7s (±5°)\n');
+fprintf('  Throttle increase: t=20-30s (80%%)\n');
+fprintf('  Descent: t=40-50s (-3°)\n\n');
+
+%% ========================================================================
+%  RUN SIMULATION (Runge-Kutta 4th order integration)
+%% ========================================================================
+
+fprintf('Running simulation...\n');
+
+% Storage
+x_history = zeros(7, N);
+x_history(:, 1) = x0;
+
+% Derived quantities
+alpha_history = zeros(1, N);
+V_total_history = zeros(1, N);
+L_history = zeros(1, N);
+D_history = zeros(1, N);
+T_history = zeros(1, N);
+ax_history = zeros(1, N);
+az_history = zeros(1, N);
+
+tic;
+for k = 1:N-1
+    
+    % Current state and control
+    x_current = x_history(:, k);
+    u_control = [delta_e(k); delta_t(k)];
+    
+    % Runge-Kutta 4th order
+    k1 = aircraft_dynamics(time(k), x_current, u_control, params);
+    k2 = aircraft_dynamics(time(k) + dt/2, x_current + dt/2*k1, u_control, params);
+    k3 = aircraft_dynamics(time(k) + dt/2, x_current + dt/2*k2, u_control, params);
+    k4 = aircraft_dynamics(time(k) + dt, x_current + dt*k3, u_control, params);
+    
+    x_next = x_current + (dt/6) * (k1 + 2*k2 + 2*k3 + k4);
+    x_history(:, k+1) = x_next;
+    
+    % Calculate derived quantities
+    u = x_next(1);
+    w = x_next(2);
+    h = x_next(5);
+    
+    U_total = U0 + u;
+    V_total = sqrt(U_total^2 + w^2);
+    alpha = atan2(w, U_total);
+    
+    rho = rho0 * exp(-h/10400);
+    q_bar = 0.5 * rho * V_total^2;
+    
+    CL = CL0 + CLalpha*alpha + CLdelta_e*delta_e(k);
+    CD = CD0 + K*CL^2;
+    
+    L = q_bar * S * CL;
+    D = q_bar * S * CD;
+    T = T_max * delta_t(k);
+    
+    alpha_history(k+1) = alpha;
+    V_total_history(k+1) = V_total;
+    L_history(k+1) = L;
+    D_history(k+1) = D;
+    T_history(k+1) = T;
+    
+    % Accelerations (body frame)
+    ax_history(k+1) = (T - D)/m;
+    az_history(k+1) = L/m;
+    
+    if mod(k, 1000) == 0
+        fprintf('  t = %.1f s, h = %.0f m, V = %.1f m/s\n', time(k), h, V_total);
+    end
+end
+
+sim_time = toc;
+fprintf('Simulation complete: %.3f seconds\n\n', sim_time);
+
+%% ========================================================================
+%  EXTRACT RESULTS
+%% ========================================================================
+
+u_history = x_history(1, :);
+w_history = x_history(2, :);
+q_history = x_history(3, :);
+theta_history = x_history(4, :);
+h_history = x_history(5, :);
+px_history = x_history(6, :);
+pz_history = x_history(7, :);
+
+% Convert to engineering units
+theta_deg = rad2deg(theta_history);
+alpha_deg = rad2deg(alpha_history);
+delta_e_deg = rad2deg(delta_e);
+q_deg_s = rad2deg(q_history);
+
+fprintf('================================================================\n');
+fprintf('SIMULATION RESULTS\n');
+fprintf('================================================================\n\n');
+
+fprintf('Initial Conditions:\n');
+fprintf('  Altitude: %.0f m\n', h0);
+fprintf('  Velocity: %.1f m/s\n', U0);
+fprintf('  Pitch: %.1f deg\n\n', theta_deg(1));
+
+fprintf('Final Conditions:\n');
+fprintf('  Altitude: %.0f m (Δh = %+.0f m)\n', h_history(end), h_history(end)-h0);
+fprintf('  Velocity: %.1f m/s\n', V_total_history(end));
+fprintf('  Pitch: %.1f deg\n', theta_deg(end));
+fprintf('  Distance traveled: %.0f m\n\n', px_history(end));
+
+fprintf('Extremes:\n');
+fprintf('  Max altitude: %.0f m\n', max(h_history));
+fprintf('  Min altitude: %.0f m\n', min(h_history));
+fprintf('  Max velocity: %.1f m/s\n', max(V_total_history));
+fprintf('  Max AoA: %.2f deg\n', max(alpha_deg));
+fprintf('  Max pitch rate: %.2f deg/s\n', max(q_deg_s));
+fprintf('  Max ax: %.2f m/s²\n', max(ax_history));
+fprintf('  Max az: %.2f m/s²\n\n', max(az_history));
+
+%% ========================================================================
+%  VISUALIZATION
+%% ========================================================================
+
+fprintf('Generating plots...\n\n');
+
+figure('Position', [50 50 1800 1000], 'Name', 'MIT OCW Aircraft Dynamics');
+
+% Plot 1: Altitude profile
+subplot(3,3,1);
+plot(time, h_history, 'b-', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Altitude h (m)');
+title('Altitude vs Time');
+grid on;
+
+% Plot 2: Velocities
+subplot(3,3,2);
+plot(time, U0 + u_history, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, w_history, 'r-', 'LineWidth', 1.5);
+plot(time, V_total_history, 'k--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Velocity (m/s)');
+title('Velocities');
+legend('u (forward)', 'w (vertical)', 'V_{total}', 'Location', 'best');
+grid on;
+
+% Plot 3: Pitch angle and AoA
+subplot(3,3,3);
+plot(time, theta_deg, 'b-', 'LineWidth', 2); hold on;
+plot(time, alpha_deg, 'r-', 'LineWidth', 1.5);
+xlabel('Time (s)'); ylabel('Angle (deg)');
+title('Pitch Angle θ and Angle of Attack α');
+legend('θ (pitch)', 'α (AoA)', 'Location', 'best');
+grid on;
+
+% Plot 4: Pitch rate
+subplot(3,3,4);
+plot(time, q_deg_s, 'b-', 'LineWidth', 1.5);
+xlabel('Time (s)'); ylabel('Pitch Rate q (deg/s)');
+title('Pitch Rate');
+grid on;
+
+% Plot 5: Control inputs
+subplot(3,3,5);
+yyaxis left;
+plot(time, delta_e_deg, 'b-', 'LineWidth', 1.5);
+ylabel('Elevator δ_e (deg)');
+yyaxis right;
+plot(time, delta_t*100, 'r-', 'LineWidth', 1.5);
+ylabel('Throttle (%)');
+xlabel('Time (s)');
+title('Control Inputs');
+grid on;
+
+% Plot 6: Forces
+subplot(3,3,6);
+plot(time, T_history/1000, 'r-', 'LineWidth', 1.5); hold on;
+plot(time, L_history/1000, 'b-', 'LineWidth', 1.5);
+plot(time, D_history/1000, 'k-', 'LineWidth', 1.5);
+xlabel('Time (s)'); ylabel('Force (kN)');
+title('Aerodynamic Forces');
+legend('Thrust', 'Lift', 'Drag', 'Location', 'best');
+grid on;
+
+% Plot 7: Accelerations
+subplot(3,3,7);
+plot(time, ax_history, 'b-', 'LineWidth', 1.5); hold on;
+plot(time, az_history, 'r-', 'LineWidth', 1.5);
+xlabel('Time (s)'); ylabel('Acceleration (m/s²)');
+title('Body-Axis Accelerations');
+legend('a_x (forward)', 'a_z (vertical)', 'Location', 'best');
+grid on;
+
+% Plot 8: Flight path (side view)
+subplot(3,3,8);
+plot(px_history, h_history, 'b-', 'LineWidth', 2);
+xlabel('Horizontal Distance (m)'); ylabel('Altitude (m)');
+title('Flight Path (Side View)');
+grid on;
+axis equal;
+
+% Plot 9: Phase portrait (θ vs q)
+subplot(3,3,9);
+plot(theta_deg, q_deg_s, 'b-', 'LineWidth', 1.5);
+xlabel('Pitch Angle θ (deg)'); ylabel('Pitch Rate q (deg/s)');
+title('Phase Portrait');
+grid on;
+
+fprintf('================================================================\n');
+fprintf('COMPLETE MIT OCW AIRCRAFT MODEL DEMONSTRATION\n');
+fprintf('================================================================\n');
