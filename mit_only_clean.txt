@@ -1,0 +1,63 @@
+clear; clc; close all;
+
+fprintf('MIT OCW 16.333 NAVION AIRCRAFT MODEL\n\n');
+
+%% MIT Model (from lecture notes)
+A = [-0.045  0.036   0      -0.322;
+      0.369 -2.02   50       0;
+      0.191 -3.96   -2.98    0;
+      0      0       1       0];
+
+B = [-0.0003; -0.076; -0.867; 0];
+C = [0 0 0 1];
+Ts = 0.01;
+
+Ad = expm(A*Ts);
+Bd = (A\(Ad-eye(4)))*B;
+Cd = C;
+
+%% Simulation
+t = 0:Ts:10;
+N = length(t);
+
+% Control: Elevator doublet
+u = zeros(1,N);
+u(100:300) = 10*pi/180;   % +10 deg
+u(300:500) = -10*pi/180;  % -10 deg
+
+% Initialize
+x = [0;0;0;0];
+x_hist = zeros(4,N);
+
+% Run simulation
+for k = 1:N
+    x = Ad*x + Bd*u(k);
+    x_hist(:,k) = x;
+end
+
+%% Results
+fprintf('Max pitch angle: %.1f deg\n', max(abs(x_hist(4,:)))*180/pi);
+fprintf('Max pitch rate: %.1f deg/s\n', max(abs(x_hist(3,:)))*180/pi);
+
+%% Plots
+figure('Position',[50 50 1600 600]);
+
+subplot(1,3,1);
+plot(t, x_hist(1,:));
+xlabel('Time (s)'); ylabel('u (m/s)');
+title('Forward Velocity');
+grid on;
+
+subplot(1,3,2);
+plot(t, x_hist(3,:)*180/pi);
+xlabel('Time (s)'); ylabel('q (deg/s)');
+title('Pitch Rate');
+grid on;
+
+subplot(1,3,3);
+plot(t, x_hist(4,:)*180/pi);
+xlabel('Time (s)'); ylabel('theta (deg)');
+title('Pitch Angle');
+grid on;
+
+fprintf('\nMIT Model Complete\n');

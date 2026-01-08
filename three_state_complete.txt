@@ -1,0 +1,329 @@
+clear; clc; close all;
+
+fprintf('3-STATE AIRCRAFT MODEL - COMPLETE SYSTEM\n\n');
+
+%% ========================================================================
+%  PART 1: MODEL (3 states: u, w, q)
+%% ========================================================================
+
+A = [-0.313 56.7 0; -0.0139 -0.426 0; 0 56.7 0];
+B = [0.232; 0.0203; 0];
+C = [0 0 1];  % Output: theta (from q integrated)
+Ts = 0.01;
+
+Ad = expm(A*Ts);
+Bd = (A\(Ad-eye(3)))*B;
+Cd = C;
+
+t = 0:Ts:10;
+N = length(t);
+u_input = 0.1*ones(1,N);
+
+% FAULT at t=3-5s (BIG fault to see clearly!)
+fault_start = 300;
+fault_end = 500;
+fault_mag = 0.5;  % 0.5 rad = 28.6 degrees
+
+Q = eye(3)*0.01;
+R = 0.05;
+L_Q = chol(Q,'lower');
+
+fprintf('Fault: t=3-5s, magnitude=%.1f rad (%.0f deg)\n\n', fault_mag, rad2deg(fault_mag));
+
+%% ========================================================================
+%  PART 2: INITIALIZE
+%% ========================================================================
+
+% IN-AIR (with fault)
+x_air = [0;0;0];
+x_air_est = [0;0;0];
+P_air = eye(3);
+theta_air = 0;
+
+% GROUND (no fault)
+x_gnd = [0;0;0];
+x_gnd_est = [0;0;0];
+P_gnd = eye(3);
+theta_gnd = 0;
+
+% Storage
+theta_air_vec = zeros(1,N);
+theta_gnd_vec = zeros(1,N);
+theta_diff_vec = zeros(1,N);
+K_norm = zeros(1,N);
+
+chi2_stat = zeros(1,N);
+cusum_stat = zeros(1,N);
+fault_chi2 = zeros(1,N);
+fault_cusum = zeros(1,N);
+
+% Quantization
+theta_before = zeros(1,N);
+theta_after = zeros(1,N);
+s1_vec = zeros(1,N);
+s2_vec = zeros(1,N);
+s3_vec = zeros(1,N);
+packed_vec = zeros(1,N);
+flags_vec = zeros(1,N);
+
+% Detection params
+window_len = 10;
+chi2_thresh = 18.0;
+resid_window = zeros(1,window_len);
+cusum_thresh = 3.0;
+cusum_drift = 0.5;
+cusum_pos = 0;
+cusum_neg = 0;
+
+K_baseline = 0;
+
+fprintf('Starting simulation...\n');
+
+%% ========================================================================
+%  PART 3: MAIN LOOP
+%% ========================================================================
+
+for k = 1:N
+    
+    %% IN-AIR MODEL
+    w = L_Q*randn(3,1);
+    x_air = Ad*x_air + Bd*u_input(k) + w;
+    theta_air = theta_air + Cd*x_air*Ts;  % Integrate q to get theta
+    
+    v = sqrt(R)*randn;
+    y_air = theta_air + v;
+    
+    % INJECT FAULT
+    if k >= fault_start && k <= fault_end
+        y_air = y_air + fault_mag;
+    end
+    
+    % Kalman filter
+    x_pred = Ad*x_air_est + Bd*u_input(k);
+    P_pred = Ad*P_air*Ad' + Q;
+    
+    theta_pred = Cd*x_pred;
+    innov = y_air - theta_pred;
+    S = Cd*P_pred*Cd' + R;
+    K = P_pred*Cd'/S;
+    
+    x_air_est = x_pred + K*innov;
+    P_air = (eye(3) - K*Cd)*P_pred;
+    
+    theta_air_vec(k) = y_air;
+    K_norm(k) = norm(K);
+    
+    if k <= 100
+        K_baseline = K_baseline + K_norm(k)/100;
+    end
+    
+    %% GROUND MODEL (same structure, no fault)
+    w_gnd = L_Q*randn(3,1);
+    x_gnd = Ad*x_gnd + Bd*u_input(k) + w_gnd;
+    theta_gnd = theta_gnd + Cd*x_gnd*Ts;
+    
+    v_gnd = sqrt(R)*randn;
+    y_gnd = theta_gnd + v_gnd;
+    
+    x_pred_gnd = Ad*x_gnd_est + Bd*u_input(k);
+    P_pred_gnd = Ad*P_gnd*Ad' + Q;
+    
+    theta_pred_gnd = Cd*x_pred_gnd;
+    innov_gnd = y_gnd - theta_pred_gnd;
+    S_gnd = Cd*P_pred_gnd*Cd' + R;
+    K_gnd = P_pred_gnd*Cd'/S_gnd;
+    
+    x_gnd_est = x_pred_gnd + K_gnd*innov_gnd;
+    P_gnd = (eye(3) - K_gnd*Cd)*P_pred_gnd;
+    
+    theta_gnd_vec(k) = y_gnd;
+    
+    %% DIFFERENCE
+    theta_diff_vec(k) = theta_air_vec(k) - theta_gnd_vec(k);
+    innov_diff = innov - innov_gnd;
+    
+    %% CHI-SQUARED
+    resid_norm = innov_diff^2 / (S + S_gnd);
+    resid_window = [resid_window(2:end), resid_norm];
+    
+    if k >= window_len
+        chi2 = sum(resid_window);
+        chi2_stat(k) = chi2;
+        if chi2 > chi2_thresh
+            fault_chi2(k) = 1;
+        end
+    end
+    
+    %% CUSUM
+    z = innov_diff / sqrt(S + S_gnd);
+    cusum_pos = max(0, cusum_pos + z - cusum_drift);
+    cusum_neg = max(0, cusum_neg - z - cusum_drift);
+    cusum_stat(k) = max(cusum_pos, cusum_neg);
+    
+    if cusum_stat(k) > cusum_thresh
+        fault_cusum(k) = 1;
+        cusum_pos = 0;
+        cusum_neg = 0;
+    end
+    
+    %% 7-BIT QUANTIZATION (3 signals)
+    theta_before(k) = theta_diff_vec(k);
+    
+    range_theta = [-1.0, 1.0];
+    range_q = [-1.0, 1.0];
+    range_u = [-10, 10];
+    
+    val_norm = (theta_diff_vec(k) - range_theta(1)) / (range_theta(2) - range_theta(1));
+    s1 = round(val_norm * 127);
+    s1 = max(0, min(127, s1));
+    
+    s2 = round(rand*127);  % Dummy
+    s3 = round(rand*127);  % Dummy
+    
+    % 4-bit flags
+    flag_k = (K_norm(k) > 2*K_baseline);
+    flag_chi2 = fault_chi2(k);
+    flag_cusum = fault_cusum(k);
+    flag_innov = (abs(z) > 2.5);
+    flags = flag_k*8 + flag_chi2*4 + flag_cusum*2 + flag_innov;
+    
+    % Pack: s1(7) | s2(7) | s3(7) | zeros(7) | flags(4)
+    packed = uint32(s1) + bitshift(uint32(s2),7) + bitshift(uint32(s3),14) + bitshift(uint32(flags),28);
+    
+    s1_vec(k) = s1;
+    packed_vec(k) = double(packed);
+    flags_vec(k) = flags;
+    
+    % Unpack
+    s1_rx = double(bitand(packed, uint32(127)));
+    theta_after(k) = range_theta(1) + s1_rx*(range_theta(2)-range_theta(1))/127;
+    
+    % Print every 200 samples
+    if mod(k,200) == 0
+        fprintf('t=%.1fs: theta_diff=%.3f, s1=%d, packed=%u, flags=%d [%s]\n', ...
+            t(k), theta_diff_vec(k), s1, packed, flags, dec2bin(flags,4));
+    end
+end
+
+fprintf('\nDone!\n\n');
+
+%% ========================================================================
+%  PART 4: RESULTS
+%% ========================================================================
+
+ground_truth = zeros(1,N);
+ground_truth(fault_start:fault_end) = 1;
+
+tp_chi2 = sum(fault_chi2 & ground_truth);
+fp_chi2 = sum(fault_chi2 & ~ground_truth);
+tp_cusum = sum(fault_cusum & ground_truth);
+fp_cusum = sum(fault_cusum & ~ground_truth);
+
+rmse_quant = sqrt(mean((theta_before - theta_after).^2));
+
+fprintf('RESULTS:\n');
+fprintf('  Chi2: TP=%d, FP=%d (%.0f%% detected)\n', tp_chi2, fp_chi2, tp_chi2/sum(ground_truth)*100);
+fprintf('  CUSUM: TP=%d, FP=%d (%.0f%% detected)\n', tp_cusum, fp_cusum, tp_cusum/sum(ground_truth)*100);
+fprintf('  K-gain: baseline=%.3f, max=%.3f, spike=%.1fx\n', K_baseline, max(K_norm), max(K_norm)/K_baseline);
+fprintf('  Quantization RMSE: %.4f rad\n\n', rmse_quant);
+
+%% ========================================================================
+%  PART 5: PLOTS (CLEAR and SIMPLE!)
+%% ========================================================================
+
+figure('Position',[50 50 1800 1000]);
+
+% 1. IN-AIR
+subplot(3,3,1);
+plot(t, theta_air_vec, 'b-', 'LineWidth', 2);
+xline(fault_start*Ts, 'r--', 'LineWidth', 2);
+xline(fault_end*Ts, 'r--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Theta (rad)');
+title('IN-AIR MODEL (with fault 3-5s)');
+ylim([-2 2]);
+grid on;
+
+% 2. GROUND
+subplot(3,3,2);
+plot(t, theta_gnd_vec, 'g-', 'LineWidth', 2);
+xline(fault_start*Ts, 'r--', 'LineWidth', 2);
+xline(fault_end*Ts, 'r--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Theta (rad)');
+title('ON-GROUND MODEL (clean)');
+ylim([-2 2]);
+grid on;
+
+% 3. DIFFERENCE
+subplot(3,3,3);
+plot(t, theta_diff_vec, 'b-', 'LineWidth', 2);
+xline(fault_start*Ts, 'r--', 'LineWidth', 2);
+xline(fault_end*Ts, 'r--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Difference (rad)');
+title('DIFFERENCE (Fault Signal)');
+grid on;
+
+% 4. KALMAN GAIN
+subplot(3,3,4);
+plot(t, K_norm, 'b-', 'LineWidth', 2);
+yline(K_baseline, 'g--', 'LineWidth', 2, 'Label', 'Baseline');
+xline(fault_start*Ts, 'r--', 'LineWidth', 2);
+xline(fault_end*Ts, 'r--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('||K||');
+title('KALMAN GAIN (should spike at fault!)');
+grid on;
+
+% 5. CHI-SQUARED
+subplot(3,3,5);
+plot(t, chi2_stat, 'b-', 'LineWidth', 1.5);
+yline(chi2_thresh, 'r--', 'LineWidth', 2);
+xline(fault_start*Ts, 'k--');
+xline(fault_end*Ts, 'k--');
+xlabel('Time (s)'); ylabel('Statistic');
+title(sprintf('CHI-SQUARED (%d detections)', sum(fault_chi2)));
+grid on;
+
+% 6. CUSUM
+subplot(3,3,6);
+plot(t, cusum_stat, 'b-', 'LineWidth', 1.5);
+yline(cusum_thresh, 'r--', 'LineWidth', 2);
+xline(fault_start*Ts, 'k--');
+xline(fault_end*Ts, 'k--');
+xlabel('Time (s)'); ylabel('Statistic');
+title(sprintf('CUSUM (%d detections)', sum(fault_cusum)));
+grid on;
+
+% 7. QUANTIZATION
+subplot(3,3,7);
+plot(t, theta_before, 'b-', 'LineWidth', 1.5); hold on;
+plot(t, theta_after, 'r-', 'LineWidth', 1);
+xlabel('Time (s)'); ylabel('Theta (rad)');
+title(sprintf('7-bit Quantization (RMSE=%.4f)', rmse_quant));
+legend('Before', 'After', 'Location', 'best');
+grid on;
+
+% 8. QUANTIZED VALUES
+subplot(3,3,8);
+plot(t, s1_vec, 'b-');
+xlabel('Time (s)'); ylabel('Quantized (0-127)');
+title('Signal 1 After 7-bit Quantization');
+grid on;
+
+% 9. STATUS FLAGS
+subplot(3,3,9);
+plot(t, flags_vec, 'k-', 'LineWidth', 1.5);
+xline(fault_start*Ts, 'r--', 'LineWidth', 2);
+xline(fault_end*Ts, 'r--', 'LineWidth', 2);
+xlabel('Time (s)'); ylabel('Flag Value (0-15)');
+title('4-bit STATUS FLAGS');
+grid on;
+
+fprintf('WHAT TO OBSERVE IN PLOTS:\n');
+fprintf('  1. In-Air: Should jump up at t=3s (fault starts)\n');
+fprintf('  2. Ground: Should stay smooth (no fault)\n');
+fprintf('  3. Difference: Should spike at t=3-5s\n');
+fprintf('  4. K-gain: Should SPIKE UP at t=3s, settle at t=5s\n');
+fprintf('  5. Chi2: Should exceed threshold at t=3-5s\n');
+fprintf('  6. CUSUM: Should exceed threshold at t=3-5s\n');
+fprintf('  7. Quantization: Before vs After (should be close)\n');
+fprintf('  8. s1: Should spike when fault present\n');
+fprintf('  9. Flags: Should be high (>0) during fault\n\n');
