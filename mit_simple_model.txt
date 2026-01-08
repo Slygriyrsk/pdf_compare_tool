@@ -1,0 +1,160 @@
+clear; clc; close all;
+
+%% MIT OCW 16.333 - EXACT STATE-SPACE FROM LECTURE NOTES
+% State: x = [u; w; q; theta]
+% u = forward velocity perturbation (m/s)
+% w = vertical velocity (m/s)
+% q = pitch rate (rad/s)
+% theta = pitch angle (rad)
+% Input: delta_e = elevator deflection (rad)
+
+% FROM MIT LECTURE NOTES (Example aircraft - Navion)
+A = [-0.045  0.036  0     -0.322;
+      0.369 -2.02   177    0;
+      0.191 -3.96  -2.98   0;
+      0      0      1      0];
+
+B = [-0.0003;
+     -0.076;
+     -0.867;
+      0];
+
+C = [0 0 0 1];  % Measure theta (pitch angle)
+
+Ts = 0.01;  % 100 Hz
+
+% Discretize: x[k+1] = Ad*x[k] + Bd*u[k]
+Ad = expm(A*Ts);
+Bd = (A\(Ad - eye(4)))*B;
+Cd = C;
+
+fprintf('MIT OCW Model Initialized\n');
+fprintf('States: [u, w, q, theta]\n');
+fprintf('Sampling: 100 Hz\n\n');
+
+%% SIMULATION
+t_end = 10;
+t = 0:Ts:t_end;
+N = length(t);
+
+% Control input: elevator doublet
+u_control = zeros(1,N);
+u_control(100:200) = 1*pi/180;   % +1 degree, t=1-2s
+u_control(200:300) = -1*pi/180;  % -1 degree, t=2-3s
+
+% Fault injection: t=5-7s
+fault_start = 500;
+fault_end = 700;
+fault_mag = 0.2;  % 0.2 rad bias
+
+% Initialize
+x = [0;0;0;0];
+Q = eye(4)*0.01;
+R = 0.01;
+
+% Storage
+x_history = zeros(4,N);
+y_meas = zeros(1,N);
+h_history = zeros(1,N);
+vx_history = zeros(1,N);
+vz_history = zeros(1,N);
+px_history = zeros(1,N);
+pz_history = zeros(1,N);
+
+% Initial position
+h = 1000;  % Start at 1000m altitude
+px = 0;
+pz = -h;
+U0 = 50;  % Trim velocity
+
+fprintf('Running simulation...\n');
+
+for k = 1:N
+    
+    % True dynamics
+    w_noise = sqrtm(Q)*randn(4,1);
+    x = Ad*x + Bd*u_control(k) + w_noise;
+    
+    % Measurement
+    v_noise = sqrt(R)*randn;
+    y_meas(k) = Cd*x + v_noise;
+    
+    % Inject fault
+    if k >= fault_start && k <= fault_end
+        y_meas(k) = y_meas(k) + fault_mag;
+    end
+    
+    x_history(:,k) = x;
+    
+    % POSITION INTEGRATION (add to MIT model)
+    % Total velocities
+    U_total = U0 + x(1);  % u + trim
+    W_total = x(2);       % w
+    theta = x(4);
+    
+    % Inertial velocities: rotate from body to inertial frame
+    vx = U_total*cos(theta) - W_total*sin(theta);
+    vz = U_total*sin(theta) + W_total*cos(theta);
+    
+    % Integrate position
+    px = px + vx*Ts;
+    pz = pz + vz*Ts;
+    h = -pz;
+    
+    vx_history(k) = vx;
+    vz_history(k) = vz;
+    px_history(k) = px;
+    pz_history(k) = pz;
+    h_history(k) = h;
+    
+end
+
+fprintf('Simulation complete\n\n');
+
+%% RESULTS
+fprintf('RESULTS:\n');
+fprintf('Final altitude: %.0f m (change: %+.0f m)\n', h, h-1000);
+fprintf('Distance traveled: %.0f m\n', px);
+fprintf('Max pitch: %.2f deg\n', max(abs(x_history(4,:)))*180/pi);
+fprintf('Max pitch rate: %.2f deg/s\n\n', max(abs(x_history(3,:)))*180/pi);
+
+%% PLOTS
+figure('Position',[50 50 1600 800]);
+
+subplot(2,3,1);
+plot(t, x_history(1,:)+U0);
+xlabel('Time (s)'); ylabel('u (m/s)');
+title('Forward Velocity');
+grid on;
+
+subplot(2,3,2);
+plot(t, x_history(2,:));
+xlabel('Time (s)'); ylabel('w (m/s)');
+title('Vertical Velocity');
+grid on;
+
+subplot(2,3,3);
+plot(t, x_history(3,:)*180/pi);
+xlabel('Time (s)'); ylabel('q (deg/s)');
+title('Pitch Rate');
+grid on;
+
+subplot(2,3,4);
+plot(t, x_history(4,:)*180/pi); hold on;
+plot([fault_start*Ts fault_start*Ts], ylim, 'r--');
+plot([fault_end*Ts fault_end*Ts], ylim, 'r--');
+xlabel('Time (s)'); ylabel('θ (deg)');
+title('Pitch Angle (with fault 5-7s)');
+grid on;
+
+subplot(2,3,5);
+plot(t, h_history);
+xlabel('Time (s)'); ylabel('Altitude (m)');
+title('Altitude');
+grid on;
+
+subplot(2,3,6);
+plot(px_history, h_history, 'LineWidth', 2);
+xlabel('Horizontal (m)'); ylabel('Altitude (m)');
+title('Flight Path');
+grid on;
