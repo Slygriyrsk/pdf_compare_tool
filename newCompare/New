@@ -1,0 +1,148 @@
+Good. We’ll keep it technically solid but natural — like a serious UG research paper, not a journal trying too hard.
+
+We’ll stick to **Option B: Hybrid GRU–Kalman Observer for Timely Flight Data Recovery**.
+
+---
+
+# ✅ Rewritten ABSTRACT (Clean, Technical, Student Tone)
+
+**ABSTRACT**
+
+Timely recovery of flight data plays a critical role in post-accident investigation and real-time flight monitoring. In long-range operations, especially over oceanic regions, transmission of flight data (TFD) through satellite or RF links is constrained by limited bandwidth, transmission cost, and intermittent connectivity. As a result, the received data at ground stations may be quantized, noisy, or incomplete. Classical state estimation techniques such as Kalman filtering rely heavily on accurate physical models and Gaussian noise assumptions, which may not hold under such degraded communication conditions.
+
+This paper proposes a hybrid estimation framework combining a physics-based Kalman Filter (KF) with a data-driven Gated Recurrent Unit (GRU) network for longitudinal state and disturbance reconstruction of a Boeing 747 aircraft model. The KF performs model-based prediction, while the GRU learns temporal patterns in the innovation sequence to estimate gust disturbances and compensate for model mismatch. The proposed approach leverages both the interpretability of model-based observers and the adaptability of recurrent neural networks. Simulation studies under gust excitation, packet dropouts, and measurement noise demonstrate improved state recovery accuracy compared to standalone KF estimation. The results suggest that hybrid recurrent observers can enhance robustness of flight data recovery in bandwidth-limited transmission environments.
+
+---
+
+# ✅ Rewritten INTRODUCTION (Structured and Natural)
+
+**1. INTRODUCTION**
+
+Accurate reconstruction of flight parameters is essential for flight safety analysis, accident investigation, and real-time monitoring of aircraft performance. Modern aircraft increasingly rely on Transmission of Flight Data (TFD) systems to stream selected parameters from onboard sensors to ground-based monitoring systems. However, long-distance satellite communication channels are inherently bandwidth-limited and costly. As a result, transmitted data is often compressed, quantized, or intermittently lost, leading to incomplete or degraded flight information at the receiver side.
+
+Traditional estimation techniques in aerospace applications are predominantly model-based. Methods such as the Output Error Method (OEM), Filter Error Method (FEM), and Kalman Filtering frameworks rely on known system dynamics and statistical noise assumptions. While these methods perform well under ideal measurement conditions, their performance deteriorates when the received data contains packet dropouts, non-Gaussian disturbances, or unmodeled aerodynamic effects such as gusts.
+
+In longitudinal aircraft dynamics, environmental disturbances like wind gusts introduce structured bias into the system states. When the ground-based estimator does not explicitly model these disturbances, the innovation sequence of the Kalman Filter becomes temporally correlated rather than white. This indicates the presence of information not captured by the physics model.
+
+To address this limitation, this work proposes a hybrid observer that integrates a model-based Kalman Filter with a Gated Recurrent Unit (GRU) network. The Kalman Filter provides physics-consistent state prediction, while the GRU learns the temporal structure of the innovation sequence to estimate gust disturbances and compensate for modeling errors. By combining model knowledge with learned temporal correction, the proposed framework aims to improve robustness of flight data recovery under degraded transmission conditions.
+
+The study focuses on the discrete-time longitudinal dynamics of a Boeing 747 aircraft modeled with five states: forward velocity, vertical velocity, pitch rate, pitch angle, and altitude. The proposed hybrid architecture is evaluated using simulated flight data under gust excitation and measurement noise.
+
+---
+
+That’s clean. No unnecessary textbook lecture. Clear problem → gap → solution.
+
+---
+
+# ✅ Now Your Flow Diagram (Control-System Style)
+
+Below is your **final hybrid structure**, written like a control block diagram.
+
+---
+
+## 🔷 HYBRID GRU–KF OBSERVER ARCHITECTURE
+
+```
+                    ┌────────────────────────────┐
+ Control Input u_k ─▶  True Aircraft Model       │
+                    │  x_{k+1}=A x + B u + B_w g │
+ Gust g_k ─────────▶                            │
+                    └──────────┬─────────────────┘
+                               │
+                               ▼
+                        Measurement y_k
+                               │
+                               ▼
+               ┌────────────────────────────────┐
+               │   Ground-Based Physics Model   │
+               │  (No gust term in prediction)  │
+               └──────────┬─────────────────────┘
+                          │
+                          ▼
+                 Kalman Prediction Step
+                 x̂_{k|k-1} = A x̂ + B u
+                          │
+                          ▼
+              Innovation: ỹ_k = y_k - C x̂_{k|k-1}
+                          │
+                          ▼
+             ┌─────────────────────────────┐
+             │ Innovation Buffer (Window N)│
+             └──────────┬──────────────────┘
+                        │
+                        ▼
+                 ┌────────────────┐
+                 │      GRU       │
+                 │ Learns gust &  │
+                 │ model mismatch │
+                 └────────┬───────┘
+                          │
+                          ▼
+                Estimated Gust ĝ_k
+                          │
+                          ▼
+         Corrected Prediction:
+         x̂_corr = x̂_{k|k-1} + B_w ĝ_k
+                          │
+                          ▼
+                 Kalman Update Step
+                          │
+                          ▼
+                   Final State Estimate
+```
+
+---
+
+# 🔷 Mathematical Flow Summary
+
+Prediction:
+[
+\hat{x}*{k|k-1} = A_d \hat{x}*{k-1|k-1} + B_d u_k
+]
+
+Innovation:
+[
+\tilde{y}*k = y_k - C \hat{x}*{k|k-1}
+]
+
+GRU learns:
+[
+\hat{g}*k = f*{GRU}(\tilde{y}_{k-N+1:k})
+]
+
+Correction:
+[
+\hat{x}*{k|k-1}^{corr} = \hat{x}*{k|k-1} + B_w \hat{g}_k
+]
+
+Update:
+Standard Kalman update using corrected prediction.
+
+---
+
+# 🎯 What Makes This Strong
+
+* Physics handles short-term prediction.
+* GRU handles temporal correlation in residual.
+* Gust becomes a learned disturbance.
+* Innovation becomes information-rich signal.
+
+That’s the core story.
+
+---
+
+Later we can:
+
+* Formalize stability discussion
+* Add confidence weighting block
+* Write patent-style claim language
+* Design training algorithm section
+
+For now, this gives you:
+
+✔ Clean abstract
+✔ Structured introduction
+✔ Proper system architecture
+✔ Clear mathematical flow
+
+When you're ready, we go deeper.
