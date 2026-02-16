@@ -1,0 +1,46 @@
+                    ┌────────────────────────────┐
+ Control Input u_k ─▶  True Aircraft Model       │
+                    │  x_{k+1}=A x + B u + B_w g │
+ Gust g_k ─────────▶                            │
+                    └──────────┬─────────────────┘
+                               │
+                               ▼
+                        Measurement y_k
+                               │
+                               ▼
+               ┌────────────────────────────────┐
+               │   Ground-Based Physics Model   │
+               │  (No gust term in prediction)  │
+               └──────────┬─────────────────────┘
+                          │
+                          ▼
+                 Kalman Prediction Step
+                 x̂_{k|k-1} = A x̂ + B u
+                          │
+                          ▼
+              Innovation: ỹ_k = y_k - C x̂_{k|k-1}
+                          │
+                          ▼
+             ┌─────────────────────────────┐
+             │ Innovation Buffer (Window N)│
+             └──────────┬──────────────────┘
+                        │
+                        ▼
+                 ┌────────────────┐
+                 │      GRU       │
+                 │ Learns gust &  │
+                 │ model mismatch │
+                 └────────┬───────┘
+                          │
+                          ▼
+                Estimated Gust ĝ_k
+                          │
+                          ▼
+         Corrected Prediction:
+         x̂_corr = x̂_{k|k-1} + B_w ĝ_k
+                          │
+                          ▼
+                 Kalman Update Step
+                          │
+                          ▼
+                   Final State Estimate
