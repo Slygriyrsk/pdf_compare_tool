@@ -1,0 +1,183 @@
+%% ==============================================================
+%  BRUTE FORCE LONGITUDINAL AIRCRAFT + KF + GRU (NO TOOLBOX)
+%  States: [u w q theta h]'
+%  Control: derivatives of delta_e and delta_p
+% ==============================================================
+
+clear; clc; close all;
+
+%% ===================== SIMULATION SETUP =======================
+Ts = 0.01;
+T  = 40;
+N  = round(T/Ts);
+
+%% ===================== CONSTANTS ==============================
+g = 9.81;
+U0 = 235.9;
+
+%% ===================== AIRCRAFT PARAMETERS ====================
+Xu = -1.982e3;   Xw = 4.025e3;
+Zu = -2.595e4;   Zw = -9.030e4;   Zq = -4.524e5;   Zwd = 1.909e3;
+Mu = 1.593e4;    Mw = -1.563e5;   Mq = -1.521e7;   Mwd = -1.702e4;
+
+S = 511; cbar = 8.324;
+Iyy = 0.449e8;
+rho = 0.3045;
+m = 2.83176e6/g;
+
+Xdp = 0.3*m*g;  Zdp = 0;  Mdp = 0;
+Xde = -3.818e-6*(0.5*rho*U0^2*S);
+Zde = -0.3648*(0.5*rho*U0^2*S);
+Mde = -1.444*(0.5*rho*U0^2*S*cbar);
+
+%% ===================== CONTINUOUS MATRICES ====================
+A = [ Xu/m, Xw/m, 0, -g;
+      Zu/(m-Zwd), Zw/(m-Zwd), (Zq+m*U0)/(m-Zwd), 0;
+     (Mu+Zu*Mwd/(m-Zwd))/Iyy, ...
+     (Mw+Zw*Mwd/(m-Zwd))/Iyy, ...
+     (Mq+(Zq+m*U0)*Mwd/(m-Zwd))/Iyy, 0;
+      0 0 1 0 ];
+
+A_aug = [A zeros(4,1);
+         0 1 0 U0 0];
+
+B_aug = [ Xde/m, Xdp/m;
+          Zde/(m-Zwd), Zdp/(m-Zwd);
+          (Mde + Zde*Mwd/(m-Zwd))/Iyy, ...
+          (Mdp + Zdp*Mwd/(m-Zwd))/Iyy;
+          0 0;
+          0 0 ];
+
+Bw_aug = [ -Xu/m, -Xw/m, 0;
+           -Zu/(m-Zwd), -Zw/(m-Zwd), 0;
+           (-Mu - Zu*Mwd/(m-Zwd))/Iyy, ...
+           (-Mw - Zw*Mwd/(m-Zwd))/Iyy, -Mq/Iyy;
+           0 0 0;
+           0 0 0 ];
+
+%% ===================== DISCRETIZATION (EULER) ==================
+Ad  = eye(5) + Ts*A_aug;
+Bd  = Ts*B_aug;
+Bwd = Ts*Bw_aug;
+
+%% ===================== STORAGE ================================
+x_true = zeros(5,N);
+x_kf   = zeros(5,N);
+x_gru  = zeros(5,N);
+
+x_true(:,1) = [5; 1; 0.02; 0.01; 1000];
+x_kf(:,1)   = x_true(:,1);
+x_gru(:,1)  = x_true(:,1);
+
+%% ===================== CONTROL (DERIVATIVES) ==================
+u = zeros(2,N);
+udot = zeros(2,N);
+
+for k = 2:N
+    udot(:,k) = 0.01*randn(2,1);
+    u(:,k) = u(:,k-1) + Ts*udot(:,k);
+end
+
+%% ===================== GUST MODEL =============================
+sigma_g = 0.5;
+
+%% ===================== KALMAN FILTER ==========================
+C = [1 0 0 0 0;
+     0 1 0 0 0;
+     0 0 1 0 0;
+     0 0 0 1 0];
+
+Q = 0.01*eye(5);
+R = 0.05*eye(4);
+P = eye(5);
+
+%% ===================== SIMULATION + KF ========================
+for k = 2:N
+    wg = sigma_g*randn(3,1);
+
+    x_true(:,k) = Ad*x_true(:,k-1) + Bd*u(:,k-1) + Bwd*wg;
+
+    y = C*x_true(:,k) + 0.02*randn(4,1);
+
+    x_pred = Ad*x_kf(:,k-1) + Bd*u(:,k-1);
+    P_pred = Ad*P*Ad' + Q;
+
+    K = P_pred*C'/(C*P_pred*C' + R);
+    x_kf(:,k) = x_pred + K*(y - C*x_pred);
+    P = (eye(5)-K*C)*P_pred;
+end
+
+%% ===================== GRU DEFINITIONS ========================
+sig = @(x) 1./(1+exp(-x));
+tanhf = @(x) tanh(x);
+
+nx = 7;   % x_kf(5) + udot(2)
+nh = 32;
+ny = 5;
+lr = 1e-4;
+
+Wr = 0.01*randn(nh,nx); Ur = 0.01*randn(nh,nh); br = zeros(nh,1);
+Wz = 0.01*randn(nh,nx); Uz = 0.01*randn(nh,nh); bz = zeros(nh,1);
+Wh = 0.01*randn(nh,nx); Uh = 0.01*randn(nh,nh); bh = zeros(nh,1);
+Wy = 0.01*randn(ny,nh); by = zeros(ny,1);
+
+%% ===================== GRU TRAINING ===========================
+epochs = 30;
+
+for ep = 1:epochs
+    h = zeros(nh,1);
+    total_loss = 0;
+
+    for k = 2:N-1
+        inp = [x_kf(:,k); udot(:,k)];
+
+        r = sig(Wr*inp + Ur*h + br);
+        z = sig(Wz*inp + Uz*h + bz);
+        h_tilde = tanhf(Wh*inp + Uh*(r.*h) + bh);
+        h = (1-z).*h + z.*h_tilde;
+
+        y_hat = Wy*h + by;
+        y_true = x_true(:,k+1) - x_kf(:,k+1);
+
+        e = y_hat - y_true;
+        total_loss = total_loss + e'*e;
+
+        Wy = Wy - lr*(e*h');
+        by = by - lr*e;
+    end
+
+    disp(['Epoch ',num2str(ep),' Loss = ',num2str(total_loss/N)]);
+end
+
+%% ===================== GROUND RECONSTRUCTION ==================
+h = zeros(nh,1);
+
+for k = 2:N
+    inp = [x_kf(:,k); udot(:,k)];
+
+    r = sig(Wr*inp + Ur*h + br);
+    z = sig(Wz*inp + Uz*h + bz);
+    h_tilde = tanhf(Wh*inp + Uh*(r.*h) + bh);
+    h = (1-z).*h + z.*h_tilde;
+
+    dx = Wy*h + by;
+    x_gru(:,k) = Ad*x_gru(:,k-1) + Bd*u(:,k-1) + dx;
+end
+
+%% ===================== PLOTTING ===============================
+labels = {'u','w','q','\theta','h'};
+t = (0:N-1)*Ts;
+
+figure;
+for i = 1:5
+    subplot(5,1,i)
+    plot(t,x_true(i,:),'k','LineWidth',1.2); hold on;
+    plot(t,x_kf(i,:),'r--','LineWidth',1);
+    plot(t,x_gru(i,:),'b-.','LineWidth',1);
+    ylabel(labels{i})
+    grid on
+    if i==1
+        legend('True','KF','KF+GRU')
+    end
+end
+xlabel('Time (s)')
