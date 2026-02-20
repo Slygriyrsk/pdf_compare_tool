@@ -1,0 +1,154 @@
+%% ===============================
+%  GRU + BPTT (STACKED 16 -> 8)
+%  Pure MATLAB, no toolbox
+%% ===============================
+
+clear; clc;
+
+%% Dimensions
+nx = 7;      % [x_kf(5); udot(2)]
+ny = 5;      % Δx
+nh1 = 16;
+nh2 = 8;
+
+Ts = 0.01;
+Tseq = 50;
+lr = 5e-4;
+epochs = 50;
+
+%% Activation
+sig = @(x) 1./(1+exp(-x));
+dsig = @(y) y.*(1-y);
+tanhf = @(x) tanh(x);
+dtanh = @(y) 1 - y.^2;
+
+%% Weight initialization (Xavier)
+init = @(r,c) sqrt(6/(r+c))*(2*rand(r,c)-1);
+
+Wr1 = init(nh1,nx);   Ur1 = init(nh1,nh1); br1 = zeros(nh1,1);
+Wz1 = init(nh1,nx);   Uz1 = init(nh1,nh1); bz1 = zeros(nh1,1);
+Wh1 = init(nh1,nx);   Uh1 = init(nh1,nh1); bh1 = zeros(nh1,1);
+
+Wr2 = init(nh2,nh1);  Ur2 = init(nh2,nh2); br2 = zeros(nh2,1);
+Wz2 = init(nh2,nh1);  Uz2 = init(nh2,nh2); bz2 = zeros(nh2,1);
+Wh2 = init(nh2,nh1);  Uh2 = init(nh2,nh2); bh2 = zeros(nh2,1);
+
+Wy = 0.01*randn(ny,nh2);
+by = zeros(ny,1);
+
+%% ===============================
+% TRAINING DATA (ASSUMED READY)
+% You must already have:
+% x_kf (5xN), udot (2xN), dx_true (5xN)
+%% ===============================
+
+N = size(x_kf,2);
+
+%% Normalize inputs
+inp_all = [x_kf(:,1:end-1); udot(:,1:end-1)];
+xmin = min(inp_all,[],2);
+xmax = max(inp_all,[],2);
+
+norm_inp = @(x) 2*(x - xmin)./(xmax - xmin + 1e-8) - 1;
+
+%% ===============================
+% TRAINING LOOP (TRUE BPTT)
+%% ===============================
+for ep = 1:epochs
+    loss = 0;
+
+    for t0 = 1:Tseq:N-Tseq
+
+        % ---- Storage ----
+        h1 = zeros(nh1,Tseq+1);
+        h2 = zeros(nh2,Tseq+1);
+
+        r1=z1=ht1=zeros(nh1,Tseq);
+        r2=z2=ht2=zeros(nh2,Tseq);
+        yhat = zeros(ny,Tseq);
+
+        % ---- Forward ----
+        for t = 1:Tseq
+            k = t0+t-1;
+            x = norm_inp([x_kf(:,k); udot(:,k)]);
+
+            r1(:,t)=sig(Wr1*x+Ur1*h1(:,t)+br1);
+            z1(:,t)=sig(Wz1*x+Uz1*h1(:,t)+bz1);
+            ht1(:,t)=tanhf(Wh1*x+Uh1*(r1(:,t).*h1(:,t))+bh1);
+            h1(:,t+1)=(1-z1(:,t)).*h1(:,t)+z1(:,t).*ht1(:,t);
+
+            r2(:,t)=sig(Wr2*h1(:,t+1)+Ur2*h2(:,t)+br2);
+            z2(:,t)=sig(Wz2*h1(:,t+1)+Uz2*h2(:,t)+bz2);
+            ht2(:,t)=tanhf(Wh2*h1(:,t+1)+Uh2*(r2(:,t).*h2(:,t))+bh2);
+            h2(:,t+1)=(1-z2(:,t)).*h2(:,t)+z2(:,t).*ht2(:,t);
+
+            yhat(:,t)=Wy*h2(:,t+1)+by;
+        end
+
+        dy = yhat - dx_true(:,t0:t0+Tseq-1);
+        loss = loss + mean(dy(:).^2);
+
+        %% ---- BACKWARD BPTT ----
+        dWy=zeros(size(Wy)); dby=zeros(size(by));
+        dWr1=zeros(size(Wr1)); dUr1=zeros(size(Ur1));
+        dWz1=zeros(size(Wz1)); dUz1=zeros(size(Uz1));
+        dWh1=zeros(size(Wh1)); dUh1=zeros(size(Uh1));
+
+        dWr2=zeros(size(Wr2)); dUr2=zeros(size(Ur2));
+        dWz2=zeros(size(Wz2)); dUz2=zeros(size(Uz2));
+        dWh2=zeros(size(Wh2)); dUh2=zeros(size(Uh2));
+
+        dh1_next=zeros(nh1,1);
+        dh2_next=zeros(nh2,1);
+
+        for t = Tseq:-1:1
+            dyt = dy(:,t);
+            dWy = dWy + dyt*h2(:,t+1)';
+            dby = dby + dyt;
+
+            dh2 = Wy'*dyt + dh2_next;
+
+            dz2 = dh2.*(ht2(:,t)-h2(:,t)).*dsig(z2(:,t));
+            dht2 = dh2.*z2(:,t).*dtanh(ht2(:,t));
+            dr2 = (Uh2'*dht2).*h2(:,t).*dsig(r2(:,t));
+
+            dWz2 = dWz2 + dz2*h1(:,t+1)';
+            dUz2 = dUz2 + dz2*h2(:,t)';
+            dWh2 = dWh2 + dht2*h1(:,t+1)';
+            dUh2 = dUh2 + dht2*(r2(:,t).*h2(:,t))';
+            dWr2 = dWr2 + dr2*h1(:,t+1)';
+            dUr2 = dUr2 + dr2*h2(:,t)';
+
+            dh1 = Wr2'*dr2 + Wz2'*dz2 + Wh2'*dht2 + dh1_next;
+
+            dz1 = dh1.*(ht1(:,t)-h1(:,t)).*dsig(z1(:,t));
+            dht1 = dh1.*z1(:,t).*dtanh(ht1(:,t));
+            dr1 = (Uh1'*dht1).*h1(:,t).*dsig(r1(:,t));
+
+            x = norm_inp([x_kf(:,t0+t-1); udot(:,t0+t-1)]);
+
+            dWz1 = dWz1 + dz1*x';
+            dUz1 = dUz1 + dz1*h1(:,t)';
+            dWh1 = dWh1 + dht1*x';
+            dUh1 = dUh1 + dht1*(r1(:,t).*h1(:,t))';
+            dWr1 = dWr1 + dr1*x';
+            dUr1 = dUr1 + dr1*h1(:,t)';
+
+            dh1_next = dh1;
+            dh2_next = dh2;
+        end
+
+        %% ---- SGD Update ----
+        Wy = Wy - lr*dWy; by = by - lr*dby;
+
+        Wr1=Wr1-lr*dWr1; Ur1=Ur1-lr*dUr1;
+        Wz1=Wz1-lr*dWz1; Uz1=Uz1-lr*dUz1;
+        Wh1=Wh1-lr*dWh1; Uh1=Uh1-lr*dUh1;
+
+        Wr2=Wr2-lr*dWr2; Ur2=Ur2-lr*dUr2;
+        Wz2=Wz2-lr*dWz2; Uz2=Uz2-lr*dUz2;
+        Wh2=Wh2-lr*dWh2; Uh2=Uh2-lr*dUh2;
+    end
+
+    fprintf('Epoch %d | Loss %.6f\n',ep,loss/(N/Tseq));
+end
